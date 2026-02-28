@@ -1,0 +1,15 @@
+ set terminal gif animate delay  0.01
+ set output 'contour.gif'
+ set size ratio -1
+ set xrange [-2.5 : 2.5]
+ set yrange [-2.5 : 2.5 ]
+ set grid
+ set xlabel 'x [m]';
+ set ylabel 'w [m]';
+ N=         143
+ delay=   9.99999978E-03
+ datafile="res.txt"
+ do for [i=1:N] {
+ plot datafile index i using 1:2 with lines lw 2 notitle
+ pause delay
+ }
