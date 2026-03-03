@@ -16,6 +16,32 @@ import matplotlib.pyplot as plt
 
 
 def simulate():
+    rho_floor = 1e-10
+    p_floor = 1e-8
+
+    def enforce_positivity(Uarr, n_idt, nx_local):
+        rho = np.maximum(Uarr[0, :, n_idt], rho_floor)
+        mom = Uarr[1, :, n_idt]
+        Et = Uarr[2, :, n_idt]
+
+        kinetic = 0.5 * mom * mom / rho
+        Et_min = kinetic + p_floor / (k - 1.0)
+
+        Uarr[0, :, n_idt] = rho
+        Uarr[2, :, n_idt] = np.maximum(Et, Et_min)
+        return Uarr
+
+    def enforce_positivity_slice(U_slice):
+        rho = np.maximum(U_slice[0, :], rho_floor)
+        mom = U_slice[1, :]
+        Et = U_slice[2, :]
+
+        kinetic = 0.5 * mom * mom / rho
+        Et_min = kinetic + p_floor / (k - 1.0)
+
+        U_slice[0, :] = rho
+        U_slice[2, :] = np.maximum(Et, Et_min)
+        return U_slice
     
     def primitives(U, A, n):
         """Convert conserved variables U to primitive variables (rho, u, p, E, a).
@@ -23,21 +49,16 @@ def simulate():
         """
         A_place = 1
         if U.ndim == 3:
-            rho = U[0, :, n]
+            rho = np.maximum(U[0, :, n], rho_floor)
             u   = U[1, :, n] / rho
-            E   = U[2, :, n] / rho     # total energy per unit volume
+            E   = U[2, :, n] / rho     # total specific energy
         else:
-            rho = U[0, :]
+            rho = np.maximum(U[0, :], rho_floor)
             u   = U[1, :] / rho
-            E   = U[2, :] / rho    # total energy per unit volume
+            E   = U[2, :] / rho    # total specific energy
         
-        # p = np.zeros_like(rho)
-        p = rho * (k - 1.0) * (E - 0.5 * u*u)
-
-        a = np.sqrt(k * p / rho)
-        if np.any(p == 0):
-            print("Warning: zero density or negative pressure encountered in primitives calculation.")
-            a = np.zeros_like(rho)
+        p = np.maximum(rho * (k - 1.0) * (E - 0.5 * u*u), p_floor)
+        a = np.sqrt(np.maximum(k * p / rho, 0.0))
         # shape is (nx,) for all primitives
         return rho, u, p, E, a
     
@@ -127,9 +148,14 @@ def simulate():
             ahat2 = max((k - 1.0) * (Hhat - 0.5 * uhat * uhat), eps)
             ahat = math.sqrt(ahat2)
 
-            A = np.array([[0, 1, 0],
-                        [0.5*(k-3)*uhat**2, (3-k)*uhat, k-1],
-                        [0.5*uhat*(-2*Hhat+uhat*uhat*(k-1)), Hhat - uhat*uhat*(k-1), k*uhat]])
+            # print("rhohat:", rhohat)
+            # print("uhat:", uhat)
+            # print("Hhat:", Hhat)
+            # print("ahat:", ahat)
+
+            # Amatt = np.array([[0, 1, 0],
+            #             [0.5*(k-3)*uhat**2, (3-k)*uhat, k-1],
+            #             [0.5*uhat*(-2*Hhat+uhat*uhat*(k-1)), Hhat - uhat*uhat*(k-1), k*uhat]])
 
             # R = np.array([
             #     [1.0, 1.0, 1.0],
@@ -138,13 +164,23 @@ def simulate():
             # ])
             # L = np.linalg.inv(R)
 
+            Pmatrix = np.array([[1, rhohat/(2*ahat), rhohat/(2*ahat)],
+                                [uhat, rhohat*(uhat+ahat)/(2*ahat), rhohat*(uhat-ahat)/(2*ahat)],
+                                [uhat*uhat/2, rhohat*(Hhat+uhat*ahat)/(2*ahat), rhohat*(Hhat-uhat*ahat)/(2*ahat)]])
+
+            eigenvalues = np.array([uhat, uhat + ahat, uhat - ahat])
             # Matrices containing the eigenvectors ([r1, r2, r3] as columns) and their inverses
-            Pmatrix = np.linalg.eig(A)[1]
+            # Pmatrix = np.linalg.eig(Amatt)[1]
+            # print(Pmatrix)
             Pmatrix_inverse = np.linalg.inv(Pmatrix)
             # print("eigenvectors:\n", Pmatrix)
             # print("eigenvectors inverted:\n", Pmatrix_inverse)
-
-            return Pmatrix_inverse, Pmatrix
+            # if np.linalg.eig(A)[0][0] !=0:
+            # print("eigenvalues:\n", eigenvalues)
+            # print("Eigenvectors:\n", Pmatrix)
+            # print("Inverse of eigenvectors:\n", Pmatrix_inverse)
+            # raise ValueError("Stop")
+            return Pmatrix_inverse, Pmatrix, eigenvalues
 
         def eno3_left_iphalf(w_im2, w_im1, w_i, w_ip1, w_ip2):
             p0 = (1.0 / 3.0) * w_im2 - (7.0 / 6.0) * w_im1 + (11.0 / 6.0) * w_i
@@ -173,6 +209,8 @@ def simulate():
         UmR = np.zeros((nvar, nc), dtype=Ulast.dtype)
         UpL = np.zeros((nvar, nc), dtype=Ulast.dtype)
         UpR = np.zeros((nvar, nc), dtype=Ulast.dtype)
+        eigenvals_m = np.zeros((nvar, nc), dtype=Ulast.dtype)  # to store eigenvalues at x_{i-1/2}
+        eigenvals_p = np.zeros((nvar, nc), dtype=Ulast.dtype)  # to store eigenvalues at x_{i+1/2}
 
         for j, ic in enumerate(range(3, nx - 3)):
             # Conservative states around i
@@ -185,8 +223,8 @@ def simulate():
             u_ip3 = Ulast[:, ic + 3]
 
             # Characteristic bases at interfaces x_{i-1/2} and x_{i+1/2}
-            Lm, Rm = eig_lr(u_im1, u_i)
-            Lp, Rp = eig_lr(u_i, u_ip1)
+            Lm, Rm, eigenvals_m_j = eig_lr(u_im1, u_i)
+            Lp, Rp, eigenvals_p_j = eig_lr(u_i, u_ip1)
 
             # Project stencil points to characteristic space (minus and plus interfaces)
             wm_im3 = Lm @ u_im3
@@ -231,8 +269,10 @@ def simulate():
             UmR[:, j] = Rm @ w_umR
             UpL[:, j] = Rp @ w_upL
             UpR[:, j] = Rp @ w_upR
+            eigenvals_m[:, j] = eigenvals_m_j
+            eigenvals_p[:, j] = eigenvals_p_j
 
-        return UmL, UmR, UpL, UpR
+        return UmL, UmR, UpL, UpR, eigenvals_m, eigenvals_p
     
     # Wave speed
     # Option 1 (very simple): max local characteristic speed from primitives
@@ -257,9 +297,11 @@ def simulate():
         return Amatrices
 
     def Rusanov_flux(U, A, n):
-        llam = max_wave_speed(U, A, n)
+        # llam = max_wave_speed(U, A, n)
+        beta = 0.5  # Rusanov parameter, can be tuned for stability/dissipation
 
-        UmL, UmR, UpL, UpR = eno3_reconstruct(U, n)
+        UmL, UmR, UpL, UpR, eigenvals_m, eigenvals_p = eno3_reconstruct(U, n)
+
         # print("UmL shape:", UmL.shape)
         AmL = Amatrices(UmL, A, n)
         AmR = Amatrices(UmR, A, n)
@@ -272,11 +314,13 @@ def simulate():
         fp = np.zeros_like(UpL)
 
         for i in range(UmL.shape[1]):
-            fm[:, i] = 0.5 * (AmL[:, :, i] @ UmL[:, i] + AmR[:, :, i] @ UmR[:, i]) - 0.5 * llam * (UmR[:, i] - UmL[:, i])
-            fp[:, i] = 0.5 * (ApL[:, :, i] @ UpL[:, i] + ApR[:, :, i] @ UpR[:, i]) - 0.5 * llam * (UpR[:, i] - UpL[:, i])
+            alpha_m = np.max(np.abs(eigenvals_m[:, i]))
+            alpha_p = np.max(np.abs(eigenvals_p[:, i]))
+            fm[:, i] = 0.5 * (AmL[:, :, i] @ UmL[:, i] + AmR[:, :, i] @ UmR[:, i]) - 0.5 * beta * alpha_m * (UmR[:, i] - UmL[:, i])
+            fp[:, i] = 0.5 * (ApL[:, :, i] @ UpL[:, i] + ApR[:, :, i] @ UpR[:, i]) - 0.5 * beta * alpha_p * (UpR[:, i] - UpL[:, i])
 
 
-        return fm, fp
+        return fm, fp # flux at i-1/2 and i+1/2
     
     def find_dt(U, A, dx, cfl):
         llam = max_wave_speed(U, A, n)
@@ -285,17 +329,21 @@ def simulate():
     def step_RK3(U, U1, U2, A, dt, dx, n, nx):
 
         U = Riemann_BC(U, n)
+        U = enforce_positivity(U, n, nx)
         k1 = -1/dx * (Rusanov_flux(U, A, n)[1] - Rusanov_flux(U, A, n)[0])
         U1[:, 3:nx-3, n] = U[:, 3:nx-3, n] + dt*k1
+        U1 = enforce_positivity(U1, n, nx)
 
         U1 = Riemann_BC(U1, n)
         k2 = -1/dx * (Rusanov_flux(U1, A, n)[1] - Rusanov_flux(U1, A, n)[0])
         U2[:, 3:nx-3, n] = 0.75*U[:, 3:nx-3, n] + 0.25*(U1[:, 3:nx-3, n] + dt*k2)
+        U2 = enforce_positivity(U2, n, nx)
 
         U2 = Riemann_BC(U2, n)
         k3 = -1/dx * (Rusanov_flux(U2, A, n)[1] - Rusanov_flux(U2, A, n)[0])
 
-        return (1/3)*U[:, 3:nx-3, n] + (2/3)*(U2[:, 3:nx-3, n] + dt*k3)
+        Unp1 = (1/3)*U[:, 3:nx-3, n] + (2/3)*(U2[:, 3:nx-3, n] + dt*k3)
+        return enforce_positivity_slice(Unp1)
     
     
     # Main simulation loop
@@ -338,7 +386,7 @@ def simulate():
     t_list = np.append(t_list, t)
 
     while t < t_end:
-        dt = find_dt(U, A, dx, cfl=0.9)
+        dt = find_dt(U, A, dx, cfl=0.5)
         U[:, 3:nx-3, n+1] = step_RK3(U, U1, U2, A, dt, dx, n, nx)
         U = Riemann_BC(U, n+1)
         t += dt
