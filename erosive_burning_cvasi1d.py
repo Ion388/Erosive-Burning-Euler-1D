@@ -285,15 +285,18 @@ def simulate():
     def step_RK3(U, U1, U2, A, dt, dx, n, nx):
 
         U = Riemann_BC(U, n)
-        k1 = -1/dx * (Rusanov_flux(U, A, n)[1] - Rusanov_flux(U, A, n)[0])
+        fm, fp = Rusanov_flux(U, A, n)
+        k1 = -1/dx * (fp - fm)
         U1[:, 3:nx-3, n] = U[:, 3:nx-3, n] + dt*k1
 
         U1 = Riemann_BC(U1, n)
-        k2 = -1/dx * (Rusanov_flux(U1, A, n)[1] - Rusanov_flux(U1, A, n)[0])
+        fm, fp = Rusanov_flux(U1, A, n)
+        k2 = -1/dx * (fp - fm)
         U2[:, 3:nx-3, n] = 0.75*U[:, 3:nx-3, n] + 0.25*(U1[:, 3:nx-3, n] + dt*k2)
 
         U2 = Riemann_BC(U2, n)
-        k3 = -1/dx * (Rusanov_flux(U2, A, n)[1] - Rusanov_flux(U2, A, n)[0])
+        fm, fp = Rusanov_flux(U2, A, n)
+        k3 = -1/dx * (fp - fm)
 
         return (1/3)*U[:, 3:nx-3, n] + (2/3)*(U2[:, 3:nx-3, n] + dt*k3)
     
