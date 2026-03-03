@@ -305,9 +305,9 @@ def simulate():
 
     # State
     t = 0.0
-    t_end = 6e-5
-    dx = 0.001
-    nx = 100
+    t_end = 6e-4
+    nx = 600
+    dx = 1 / (nx - 6)
 
     # Variables to track over time
     U = np.zeros((3, nx, 2000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step
@@ -338,7 +338,7 @@ def simulate():
     t_list = np.append(t_list, t)
 
     while t < t_end:
-        dt = find_dt(U, A, dx, cfl=0.5)
+        dt = find_dt(U, A, dx, cfl=0.9)
         U[:, 3:nx-3, n+1] = step_RK3(U, U1, U2, A, dt, dx, n, nx)
         U = Riemann_BC(U, n+1)
         t += dt
