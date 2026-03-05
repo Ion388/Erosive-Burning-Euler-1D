@@ -280,34 +280,18 @@ def simulate():
             return np.max(np.abs([SL, SR]))
         elif case == 'flux':
             return SL, SR
-    
 
-    def Amatrices(U, A, n):
-        _, u, _, E, _ = primitives(U, A, n)
-        U_shape = U.shape
-        Amatrices = np.zeros((3, 3, U_shape[1]))  # (nvar, nvar, nx)
-        for i in range(U_shape[1]):
-            Amatrices[:, :, i] = np.array([[0, 1, 0],
-                        [0.5*(k-3)*u[i]**2, (3-k)*u[i], k-1],
-                        [u[i]*((k-1)*u[i]**2 - k*E[i]), E[i]*k - 3/2*(k-1)*u[i]**2, k*u[i]]])
-        return Amatrices
-
-    
+    def Euler_flux(U, A, n):
+        rho, u, p, E, a = primitives(U, A, n)
+        return np.vstack((rho*u, rho*u**2 + p, u*(rho*E + p)))
 
     def HLLC_flux(U, A, n):
         UL, UR, eigenvals = weno5_reconstruct(U, n)
         rhoL, uL, pL, EL, aL = primitives(UL, A, n)  # primitives at left state
         rhoR, uR, pR, ER, aR = primitives(UR, A, n)  # primitives at right state
 
-        AL = Amatrices(UL, A, n)
-        AR = Amatrices(UR, A, n)
-
-        fL = np.zeros_like(UL)
-        fR = np.zeros_like(UR)
-
-        for i in range(UL.shape[1]):
-            fL[:, i] = AL[:, :, i] @ UL[:, i]
-            fR[:, i] = AR[:, :, i] @ UR[:, i]
+        fL = Euler_flux(UL, A, n)
+        fR = Euler_flux(UR, A, n)
 
         if wave_speed_method == 'Dava':
             SL = np.minimum(np.min(eigenvals, axis=0), 0)  # Davidson's HLL wave speed estimates
@@ -348,23 +332,33 @@ def simulate():
             llam = max_wave_speed_Toro(U, A, n, case='dt') # Toro
         return cfl * dx / llam if llam > 0 else 1e-6
     
-    def step_RK3(U, U1, U2, A, dt, dx, n, nx):
+    def SSPRK45(U, U1, U2, U3, U4, A, dt, dx, n, nx):
 
         # shock reflection NOT depicted accurately for now due to sboundary conditions
         U = Riemann_BC(U, n)
         fm, fp = HLLC_flux(U, A, n)
         k1 = -1/dx * (fp - fm)
-        U1[:, 3:nx-3, n] = U[:, 3:nx-3, n] + dt*k1
+        U1[:, 3:nx-3, n] = U[:, 3:nx-3, n] + 0.391752226571890*dt*k1
 
         U1 = Riemann_BC(U1, n)
         fm, fp = HLLC_flux(U1, A, n)
         k2 = -1/dx * (fp - fm)
-        U2[:, 3:nx-3, n] = 0.75*U[:, 3:nx-3, n] + 0.25*(U1[:, 3:nx-3, n] + dt*k2)
+        U2[:, 3:nx-3, n] = 0.444370493651235*U[:, 3:nx-3, n] + 0.555629506348765*U1[:, 3:nx-3, n] + 0.368410593050371*dt*k2
 
         U2 = Riemann_BC(U2, n)
         fm, fp = HLLC_flux(U2, A, n)
         k3 = -1/dx * (fp - fm)
-        Unp1 = (1/3)*U[:, 3:nx-3, n] + (2/3)*(U2[:, 3:nx-3, n] + dt*k3)
+        U3[:, 3:nx-3, n] = 0.620101851488403*U[:, 3:nx-3, n] + 0.379898148511597*U2[:, 3:nx-3, n] + 0.251891774271694*dt*k3
+
+        U3 = Riemann_BC(U3, n)
+        fm, fp = HLLC_flux(U3, A, n)
+        k4 = -1/dx * (fp - fm)
+        U4[:, 3:nx-3, n] = 0.178079954393132*U[:, 3:nx-3, n] + 0.821920045606868*U3[:, 3:nx-3, n] +  0.544974750228521*dt*k4
+
+        U4 = Riemann_BC(U4, n)
+        fm, fp = HLLC_flux(U4, A, n)
+        k5 = -1/dx * (fp - fm)
+        Unp1 = 0.517231671970585*U2[:, 3:nx-3, n] + 0.096059710526147*U3[:, 3:nx-3, n] + 0.063692468666290*dt*k4 + 0.386708617503268*U4[:, 3:nx-3, n] + 0.226007483236906*dt*k5
 
         return Unp1
     
@@ -428,6 +422,8 @@ def simulate():
     U = np.zeros((3, nx, 2000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step
     U1 = np.zeros((3, nx, 2000), dtype=np.float64)
     U2 = np.zeros((3, nx, 2000), dtype=np.float64)
+    U3 = np.zeros((3, nx, 2000), dtype=np.float64)
+    U4 = np.zeros((3, nx, 2000), dtype=np.float64)
     A = np.ones([1])  # test cross-sectional area
 
     # Outputs
@@ -440,7 +436,7 @@ def simulate():
 
     while t < t_end:
         dt = find_dt(U, A, dx, cfl)
-        U[:, 3:nx-3, n+1] = step_RK3(U, U1, U2, A, dt, dx, n, nx)
+        U[:, 3:nx-3, n+1] = SSPRK45(U, U1, U2, U3, U4, A, dt, dx, n, nx)
         U = Riemann_BC(U, n+1)
         t += dt
         n += 1
