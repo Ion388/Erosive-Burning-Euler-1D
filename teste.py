@@ -35,11 +35,21 @@ import numpy as np
 #                 [u[i]*(0.5*(k-1)*u[i]**2 - k*e[i]/rho[i]), e[i]/rho[i]*k - 3/2*(k-1)*u[i]**2, k*u[i]]])
 # print(Amatrices.shape)
 
-div1 = [1, 2, 3]
-div2 = [4, 5, 6]
+# div1 = [1, 2, 3]
+# div2 = [4, 5, 6]
 
-index = np.where(np.array(div1) < np.array(div2))[0]
-print(index)
+# index = np.where(np.array(div1) < np.array(div2))[0]
+# print(index)
 
-for j, ic in enumerate(range(4, 10)):
-    print(f"j={j}, ic={ic}")
+# for j, ic in enumerate(range(4, 10)):
+#     print(f"j={j}, ic={ic}")
+
+np.random.seed(42)
+eigenvals_m = np.random.rand(3, 10)  # (nvar, nx)
+eigenvals_p = np.random.rand(3, 10)  # (nvar, nx)
+print(eigenvals_m)
+print(eigenvals_p)
+for i in range(eigenvals_m.shape[1]):
+    alpha_m = np.max(np.abs([eigenvals_m, eigenvals_p]), axis=0) #Toro
+
+print(alpha_m)

@@ -14,8 +14,45 @@ import numpy as np
 from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
 
+ar = 'auto'
+height = 16
+width = 9
+dpi = 100
+title_size = 28
+label_size = 28
+tick_size = 20
+legend_size = 28
+line_color = 'orangered'
+
 
 def simulate():
+    rho_floor = 1e-10
+    p_floor = 1e-8
+
+    def enforce_positivity(Uarr, n_idt, nx_local):
+        rho = np.maximum(Uarr[0, :, n_idt], rho_floor)
+        mom = Uarr[1, :, n_idt]
+        Et = Uarr[2, :, n_idt]
+
+        kinetic = 0.5 * mom * mom / rho
+        Et_min = kinetic + p_floor / (k - 1.0)
+
+        Uarr[0, :, n_idt] = rho
+        Uarr[2, :, n_idt] = np.maximum(Et, Et_min)
+        return Uarr
+
+    def enforce_positivity_slice(U_slice):
+        rho = np.maximum(U_slice[0, :], rho_floor)
+        mom = U_slice[1, :]
+        Et = U_slice[2, :]
+
+
+        kinetic = 0.5 * mom * mom / rho
+        Et_min = kinetic + p_floor / (k - 1.0)
+
+        U_slice[0, :] = rho
+        U_slice[2, :] = np.maximum(Et, Et_min)
+        return U_slice
     
     def primitives(U, A, n):
         """Convert conserved variables U to primitive variables (rho, u, p, E, a).
@@ -23,22 +60,16 @@ def simulate():
         """
         A_place = 1
         if U.ndim == 3:
-            rho = U[0, :, n]
+            rho = np.maximum(U[0, :, n], rho_floor)
             u   = U[1, :, n] / rho
-            E   = U[2, :, n] / rho     # total energy per unit volume
+            E   = U[2, :, n] / rho     # total specific energy (per unit mass)
         else:
-            rho = U[0, :]
+            rho = np.maximum(U[0, :], rho_floor)
             u   = U[1, :] / rho
-            E   = U[2, :] / rho    # total energy per unit volume
+            E   = U[2, :] / rho    # total specific energy (per unit mass)
         
-        # p = np.zeros_like(rho)
-        p = rho * (k - 1.0) * (E - 0.5 * u*u)
-
-        a = np.sqrt(k * p / rho)
-        if np.any(p == 0):
-            print("Warning: zero density or negative pressure encountered in primitives calculation.")
-            a = np.zeros_like(rho)
-        # shape is (nx,) for all primitives
+        p = np.maximum(rho * (k - 1.0) * (E - 0.5 * u*u), p_floor)
+        a = np.sqrt(np.maximum(k * p / rho, 0.0))
         return rho, u, p, E, a
     
     def initial_Riemann(U, A, n):
@@ -47,19 +78,19 @@ def simulate():
         rhoL = 1.0
         pL = 1.0e5
         uL = 0.0
-        left_state = np.array([rhoL, rhoL*uL, (pL/(k-1) + 0.5*rhoL*uL*uL)])  # (rho*A, rho*u*A, E*A) left state
+        left_state = np.array([rhoL, rhoL*uL, (pL/(k-1) + 0.5*rhoL*uL*uL)])  # (rho*A, rho*u*A, rho*E*A) left state
 
         rhoR = 0.125
         pR = 1.0e4
         uR = 0.0
-        right_state = np.array([rhoR, rhoR*uR, (pR/(k-1) + 0.5*rhoR*uR*uR)])  # (rho*A, rho*u*A, E*A) right state
+        right_state = np.array([rhoR, rhoR*uR, (pR/(k-1) + 0.5*rhoR*uR*uR)])  # (rho*A, rho*u*A, rho*E*A) right state
         
         UL = np.repeat(left_state, shape[1]//2, axis=0).reshape(3, shape[1]//2)
         UR = np.repeat(right_state, shape[1]//2, axis=0).reshape(3, shape[1]//2)
+
         # even number of points necessary!
         U[:, :shape[1]//2, n] = UL
         U[:, shape[1]//2:, n] = UR
-        # print(U[:, :, n])
         return U
 
 
@@ -127,24 +158,13 @@ def simulate():
             ahat2 = max((k - 1.0) * (Hhat - 0.5 * uhat * uhat), eps)
             ahat = math.sqrt(ahat2)
 
-            A = np.array([[0, 1, 0],
-                        [0.5*(k-3)*uhat**2, (3-k)*uhat, k-1],
-                        [0.5*uhat*(-2*Hhat+uhat*uhat*(k-1)), Hhat - uhat*uhat*(k-1), k*uhat]])
+            Pmatrix = np.array([[1, rhohat/(2*ahat), rhohat/(2*ahat)],
+                                [uhat, rhohat*(uhat+ahat)/(2*ahat), rhohat*(uhat-ahat)/(2*ahat)],
+                                [uhat*uhat/2, rhohat*(Hhat+uhat*ahat)/(2*ahat), rhohat*(Hhat-uhat*ahat)/(2*ahat)]])
 
-            # R = np.array([
-            #     [1.0, 1.0, 1.0],
-            #     [uhat - ahat, uhat, uhat + ahat],
-            #     [Hhat - uhat * ahat, 0.5 * uhat * uhat, Hhat + uhat * ahat],
-            # ])
-            # L = np.linalg.inv(R)
-
-            # Matrices containing the eigenvectors ([r1, r2, r3] as columns) and their inverses
-            Pmatrix = np.linalg.eig(A)[1]
+            eigenvalues = np.array([uhat, uhat + ahat, uhat - ahat])
             Pmatrix_inverse = np.linalg.inv(Pmatrix)
-            # print("eigenvectors:\n", Pmatrix)
-            # print("eigenvectors inverted:\n", Pmatrix_inverse)
-
-            return Pmatrix_inverse, Pmatrix
+            return Pmatrix_inverse, Pmatrix, eigenvalues
 
         def eno3_left_iphalf(w_im2, w_im1, w_i, w_ip1, w_ip2):
             p0 = (1.0 / 3.0) * w_im2 - (7.0 / 6.0) * w_im1 + (11.0 / 6.0) * w_i
@@ -169,82 +189,103 @@ def simulate():
             return [p0, p1, p2][s]
 
         nc = nx - 6
-        UmL = np.zeros((nvar, nc), dtype=Ulast.dtype)
-        UmR = np.zeros((nvar, nc), dtype=Ulast.dtype)
-        UpL = np.zeros((nvar, nc), dtype=Ulast.dtype)
-        UpR = np.zeros((nvar, nc), dtype=Ulast.dtype)
+        UL = np.zeros((nvar, nc+1), dtype=Ulast.dtype)
+        UR = np.zeros((nvar, nc+1), dtype=Ulast.dtype)
+        eigenvals = np.zeros((nvar, nc+1), dtype=Ulast.dtype)
 
-        for j, ic in enumerate(range(3, nx - 3)):
-            # Conservative states around i
+        for j, ic in enumerate(range(3, nx - 2)):
             u_im3 = Ulast[:, ic - 3]
             u_im2 = Ulast[:, ic - 2]
             u_im1 = Ulast[:, ic - 1]
             u_i = Ulast[:, ic]
             u_ip1 = Ulast[:, ic + 1]
             u_ip2 = Ulast[:, ic + 2]
-            u_ip3 = Ulast[:, ic + 3]
 
-            # Characteristic bases at interfaces x_{i-1/2} and x_{i+1/2}
-            Lm, Rm = eig_lr(u_im1, u_i)
-            Lp, Rp = eig_lr(u_i, u_ip1)
+            L, R, eigenvals_j = eig_lr(u_im1, u_i)
 
             # Project stencil points to characteristic space (minus and plus interfaces)
-            wm_im3 = Lm @ u_im3
-            wm_im2 = Lm @ u_im2
-            wm_im1 = Lm @ u_im1
-            wm_i = Lm @ u_i
-            wm_ip1 = Lm @ u_ip1
-            wm_ip2 = Lm @ u_ip2
+            wm_im3 = L @ u_im3
+            wm_im2 = L @ u_im2
+            wm_im1 = L @ u_im1
+            wm_i = L @ u_i
+            wm_ip1 = L @ u_ip1
+            wm_ip2 = L @ u_ip2
 
-            wp_im2 = Lp @ u_im2
-            wp_im1 = Lp @ u_im1
-            wp_i = Lp @ u_i
-            wp_ip1 = Lp @ u_ip1
-            wp_ip2 = Lp @ u_ip2
-            wp_ip3 = Lp @ u_ip3
 
-            w_umL = np.zeros(nvar, dtype=Ulast.dtype)
-            w_umR = np.zeros(nvar, dtype=Ulast.dtype)
-            w_upL = np.zeros(nvar, dtype=Ulast.dtype)
-            w_upR = np.zeros(nvar, dtype=Ulast.dtype)
+            w_uL = np.zeros(nvar, dtype=Ulast.dtype)
+            w_uR = np.zeros(nvar, dtype=Ulast.dtype)
 
             for pidx in range(nvar):
                 # UmL: U^- at x_{i-1/2} = left ENO3 at (i-1)+1/2
-                w_umL[pidx] = eno3_left_iphalf(
+                w_uL[pidx] = eno3_left_iphalf(
                     wm_im3[pidx], wm_im2[pidx], wm_im1[pidx], wm_i[pidx], wm_ip1[pidx]
                 )
                 # UmR: U^+ at x_{i-1/2}
-                w_umR[pidx] = eno3_right_iphalf(
+                w_uR[pidx] = eno3_right_iphalf(
                     wm_im2[pidx], wm_im1[pidx], wm_i[pidx], wm_ip1[pidx], wm_ip2[pidx]
                 )
-                # UpL: U^- at x_{i+1/2}
-                w_upL[pidx] = eno3_left_iphalf(
-                    wp_im2[pidx], wp_im1[pidx], wp_i[pidx], wp_ip1[pidx], wp_ip2[pidx]
-                )
-                # UpR: U^+ at x_{i+1/2}
-                w_upR[pidx] = eno3_right_iphalf(
-                    wp_im1[pidx], wp_i[pidx], wp_ip1[pidx], wp_ip2[pidx], wp_ip3[pidx]
-                )
 
-            # Back to conservative variables
-            UmL[:, j] = Rm @ w_umL
-            UmR[:, j] = Rm @ w_umR
-            UpL[:, j] = Rp @ w_upL
-            UpR[:, j] = Rp @ w_upR
 
-        return UmL, UmR, UpL, UpR
+            UL[:, j] = R @ w_uL
+            UR[:, j] = R @ w_uR 
+            eigenvals[:, j] = eigenvals_j
+
+        return UL, UR, eigenvals
     
     # Wave speed
     # Option 1 (very simple): max local characteristic speed from primitives
-    def max_wave_speed(U, A, n):
-        _, u, _, _, a = primitives(U, A, n)
-        return np.max(np.abs(u) + a)
+    def max_wave_speed(U, A, n, case):
+        UL, UR, eigenvalues = eno3_reconstruct(U, n)
+        # _, uL, _, _, aL = primitives(UL, A, n)
+        # _, uR, _, _, aR = primitives(UR, A, n)
+        # alpha = [np.abs(uL) + aL, np.abs(uR) + aR]
+        alpha = np.abs(eigenvalues)  # max eigenvalue magnitude at each interface
+
+        if case == 'dt':
+            return np.max(alpha)
+        elif case == 'flux':
+            return np.max(alpha, axis=0)
+
+    def max_wave_speed_Toro(U, A, n, case):
+        UL, UR, eigenvals = eno3_reconstruct(U, n)
+
+        _, uL, pL, _, aL = primitives(UL, A, n)  # primitives at x_{i-1/2} left state
+        _, uR, pR, _, aR = primitives(UR, A, n)  # primitives at x_{i-1/2} right state
+
+        if np.any(pL <= 0) or np.any(pR <= 0):
+            raise ValueError("Non-positive pressure before Toro p* estimate in max_wave_speed_Toro.")
+
+        gamma_exp = (k - 1) / (2 * k)
+        power_exp = 2 * k / (k - 1)
+
+        base_num = aL + aR - 0.5 * (k - 1) * (uR - uL)
+        base_den = aL / (pL ** gamma_exp) + aR / (pR ** gamma_exp)
+
+        if np.any(base_den <= 0):
+            raise ValueError("Non-positive denominator in Toro p* estimate in max_wave_speed_Toro.")
+
+        base = base_num / base_den
+
+        if np.any(~np.isfinite(base)):
+            raise ValueError("Non-finite Toro p* base in max_wave_speed_Toro.")
+        if np.any(base <= 0):
+            raise ValueError(
+                f"Non-positive Toro p* base in max_wave_speed_Toro: min(base)={np.min(base)}"
+            )
+
+        pstarr = np.power(base, power_exp)  # Toro's p* estimate at x_{i-1/2}
+
+        qL = [1 if pstarr[i] <= pL[i] else np.sqrt(1+(k+1)/(2*k)*(pstarr[i]/pL[i]-1)) for i in range(len(pL))]
+        qR = [1 if pstarr[i] <= pR[i] else np.sqrt(1+(k+1)/(2*k)*(pstarr[i]/pR[i]-1)) for i in range(len(pR))]
+
+        SL = uL - aL*qL
+        SR = uR + aR*qR
+        
+        if case == 'dt':
+            return np.max(np.abs([SL, SR]))
+        elif case == 'flux':
+            return np.max(np.abs([SL, SR]), axis=0)
     
-    # Option 2: use nozzle exit velocity as upper bound (conservative for stability)
-    # def max_wave_speed(U, A):s
-    #     _, _, _, _, a = primitives(U, A)
-    #     _, _, v_exit, _ = nozzle_perf(p, At, eps, k, Rgas, T1, p_amb)
-    #     return max(np.max(np.abs(a)), v_exit * 1.05)  # add 5% margin for safety
 
     def Amatrices(U, A, n):
         rho, u, p, E, a = primitives(U, A, n)
@@ -257,49 +298,152 @@ def simulate():
         return Amatrices
 
     def Rusanov_flux(U, A, n):
-        llam = max_wave_speed(U, A, n)
 
-        UmL, UmR, UpL, UpR = eno3_reconstruct(U, n)
-        # print("UmL shape:", UmL.shape)
-        AmL = Amatrices(UmL, A, n)
-        AmR = Amatrices(UmR, A, n)
-        ApL = Amatrices(UpL, A, n)
-        ApR = Amatrices(UpR, A, n)
+        UL, UR, eigenvals = eno3_reconstruct(U, n)
 
-        # Rusanov Flux at u_i-1/2:
-        # Apply matrix-vector multiplication for each spatial point
-        fm = np.zeros_like(UmL)
-        fp = np.zeros_like(UpL)
+        # print("UL:", UL)
+        # print("UR:", UR)
 
-        for i in range(UmL.shape[1]):
-            fm[:, i] = 0.5 * (AmL[:, :, i] @ UmL[:, i] + AmR[:, :, i] @ UmR[:, i]) - 0.5 * llam * (UmR[:, i] - UmL[:, i])
-            fp[:, i] = 0.5 * (ApL[:, :, i] @ UpL[:, i] + ApR[:, :, i] @ UpR[:, i]) - 0.5 * llam * (UpR[:, i] - UpL[:, i])
+        # for i in range(UL.shape[1]-1):
+        #     if np.all(UL[:, i+1] == UR[:, i]):
+        #         print(f"Warning: UL and UR are identical at index {i}, which may cause zero wave speed and excessive dissipation in Rusanov flux.")
 
+        if wave_speed_method == 'simple':
+            alpha = max_wave_speed(U, A, n, case='flux')  # Simple max wave speeds at x_{i-1/2} and x_{i+1/2}
 
-        return fm, fp
+        elif wave_speed_method == 'Toro':
+            alpha = max_wave_speed_Toro(U, A, n, case='flux')  # Toro's max wave speeds at x_{i-1/2} and x_{i+1/2}
+            
+        AL = Amatrices(UL, A, n)
+        AR = Amatrices(UR, A, n)
+
+        f = np.zeros_like(UL)
+
+        for i in range(UL.shape[1]):
+            f[:, i] = 0.5 * (AL[:, :, i] @ UL[:, i] + AR[:, :, i] @ UR[:, i]) - 0.5 * beta * alpha[i] * (UR[:, i] - UL[:, i])
+
+        fm = f[:, :-1]  # flux at i-1/2
+        fp = f[:, 1:]   # flux at i+1/2
+
+        return fm, fp # flux at i-1/2 and i+1/2
+    
+    def HLL_flux(U, A, n):
+        UL, UR, eigenvals = eno3_reconstruct(U, n)
+
+        if wave_speed_method == 'simple':
+            alpha = max_wave_speed(U, A, n, case='flux')  # Simple max wave speeds at x_{i-1/2} and x_{i+1/2}
+
+        elif wave_speed_method == 'Toro':
+            alpha = max_wave_speed_Toro(U, A, n, case='flux')  # Toro's max wave speeds at x_{i-1/2} and x_{i+1/2}
+            
+        AL = Amatrices(UL, A, n)
+        AR = Amatrices(UR, A, n)
+
+        fL = np.zeros_like(UL)
+        fR = np.zeros_like(UR)
+
+        for i in range(UL.shape[1]):
+            fL[:, i] = AL[:, :, i] @ UL[:, i]
+            fR[:, i] = AR[:, :, i] @ UR[:, i]
+
+        SL = np.minimum(np.min(eigenvals, axis=0), 0)  # Davidson's HLL wave speed estimates
+        SR = np.maximum(np.max(eigenvals, axis=0), 0)  # Davidson's HLL wave speed estimates
+
+        fm = np.zeros_like(UL)
+        fp = np.zeros_like(UR)
+        f = np.zeros_like(UL)
+
+        for i in range(UL.shape[1]):
+            if SL[i] >= 0:
+                f[:, i] = fL[:, i]
+                # fp[:, i] = fL[:, i]
+            elif SR[i] <= 0:
+                f[:, i] = fR[:, i]
+                # fp[:, i] = fR[:, i]
+            else:
+                f[:, i] = (SR[i]*fL[:, i] - SL[i]*fR[:, i] + SL[i]*SR[i]*(UR[:, i] - UL[:, i])) / (SR[i] - SL[i])
+                # fp[:, i] = fm[:, i]
+
+        fm = f[:, :-1]  # flux at i-1/2
+        fp = f[:, 1:]   # flux at i+1/2
+
+        # print(fm.shape)
+        return fm, fp # flux at i-1/2 and i+1/2
+
+    def HLLC_flux(U, A, n):
+        UL, UR, eigenvals = eno3_reconstruct(U, n)
     
     def find_dt(U, A, dx, cfl):
-        llam = max_wave_speed(U, A, n)
+        if wave_speed_method == 'simple':
+            llam = max_wave_speed(U, A, n, case='dt')  # Simple
+        elif wave_speed_method == 'Toro':
+            llam = max_wave_speed_Toro(U, A, n, case='dt') # Toro
         return cfl * dx / llam if llam > 0 else 1e-6
     
     def step_RK3(U, U1, U2, A, dt, dx, n, nx):
 
+        # shock reflection NOT depicted accurately for now
         U = Riemann_BC(U, n)
-        fm, fp = Rusanov_flux(U, A, n)
+        U = enforce_positivity(U, n, nx)
+        fm, fp = HLL_flux(U, A, n)
         k1 = -1/dx * (fp - fm)
         U1[:, 3:nx-3, n] = U[:, 3:nx-3, n] + dt*k1
 
         U1 = Riemann_BC(U1, n)
-        fm, fp = Rusanov_flux(U1, A, n)
+        U1 = enforce_positivity(U1, n, nx)
+        fm, fp = HLL_flux(U1, A, n)
         k2 = -1/dx * (fp - fm)
         U2[:, 3:nx-3, n] = 0.75*U[:, 3:nx-3, n] + 0.25*(U1[:, 3:nx-3, n] + dt*k2)
 
         U2 = Riemann_BC(U2, n)
-        fm, fp = Rusanov_flux(U2, A, n)
+        U2 = enforce_positivity(U2, n, nx)
+        fm, fp = HLL_flux(U2, A, n)
         k3 = -1/dx * (fp - fm)
+        Unp1 = (1/3)*U[:, 3:nx-3, n] + (2/3)*(U2[:, 3:nx-3, n] + dt*k3)
 
-        return (1/3)*U[:, 3:nx-3, n] + (2/3)*(U2[:, 3:nx-3, n] + dt*k3)
+        return enforce_positivity_slice(Unp1)
     
+    def plot(U, A, n):
+
+        rho, u, p, E, a = primitives(U, A, n)
+
+        os.makedirs(f"cfl{cfl}_beta{beta}_{wave_speed_method}", exist_ok=True)
+
+        fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
+        ax.plot(rho, linewidth=4, color=line_color)
+        ax.set_ylabel("Densitate rho", fontsize=label_size)
+        ax.set_xlabel("x [m]", fontsize=label_size)
+        ax.tick_params(axis='both', which='major', labelsize=tick_size)
+        ax.grid(True)
+        ax.set_xlim(left=0.0)
+        ax.set_ylim(bottom=0.0)
+        ax.set_aspect(ar)
+        plt.savefig(f"cfl{cfl}_beta{beta}_{wave_speed_method}/rho_end.png")
+        # plt.clf()
+
+        fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
+        ax.plot(p, linewidth=4, color=line_color)
+        ax.set_ylabel("Presiune p [Pa]", fontsize=label_size)
+        ax.set_xlabel("x [m]", fontsize=label_size)
+        ax.tick_params(axis='both', which='major', labelsize=tick_size)
+        ax.grid(True)
+        ax.set_xlim(left=0.0)
+        ax.set_ylim(bottom=0.0)
+        ax.set_aspect(ar)
+        plt.savefig(f"cfl{cfl}_beta{beta}_{wave_speed_method}/p_end.png")
+        # plt.clf()
+
+        fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
+        ax.plot(u, linewidth=4, color=line_color)
+        ax.set_ylabel("Viteza u [m/s]", fontsize=label_size)
+        ax.set_xlabel("x [m]", fontsize=label_size)
+        ax.tick_params(axis='both', which='major', labelsize=tick_size)
+        ax.grid(True)
+        ax.set_xlim(left=0.0)
+        ax.set_ylim(bottom=0.0)
+        ax.set_aspect(ar)
+        plt.savefig(f"cfl{cfl}_beta{beta}_{wave_speed_method}/u_end.png")
+        # plt.clf()
     
     # Main simulation loop
 
@@ -311,6 +455,9 @@ def simulate():
     t_end = 6e-4
     nx = 600
     dx = 1 / (nx - 6)
+    cfl = 0.9
+    beta = 1  # Rusanov parameter, can be tuned for stability/dissipation
+    wave_speed_method = 'simple'  # 'simple' or 'Toro'
 
     # Variables to track over time
     U = np.zeros((3, nx, 2000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step
@@ -320,78 +467,14 @@ def simulate():
 
     # Outputs
     t_list = np.array([], dtype=np.float64)
+    t_list = np.append(t_list, t)
     
     n = 0
     U = initial_Riemann(U, A, n)
-    rho, u, p, E, a = primitives(U, A, n)
 
-    # plt.figure(figsize=(12, 8))
-    # plt.subplot(3, 1, 1)
-    # plt.plot(rho, label='rho')
-    # plt.legend()
-    # plt.subplot(3, 1, 2)
-    # plt.plot(p, label='p')
-    # plt.legend()
-    # plt.subplot(3, 1, 3)
-    # plt.plot(u, label='u')
-    # plt.legend()
-    # plt.tight_layout()
-    # plt.show()
-
-    # path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])))
-    ar = 'auto'
-    height = 16
-    width = 9
-    dpi = 100
-    title_size = 28
-    label_size = 28
-    tick_size = 20
-    legend_size = 28
-    line_color = 'orangered'
-    print(rho)
-    
-    fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
-    ax.plot(np.linspace(0, 1, nx), rho, linewidth=4, color=line_color)
-    ax.set_ylabel("Densitate rho", fontsize=label_size)
-    ax.set_xlabel("x [m]", fontsize=label_size)
-    ax.tick_params(axis='both', which='major', labelsize=tick_size)
-    ax.grid(True)
-    ax.set_xlim(left=0.0)
-    ax.set_ylim(bottom=0.0)
-    ax.set_aspect(ar)
-    plt.savefig(f"rho_start.png")
-    # plt.clf()
-
-    fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
-    ax.plot(np.linspace(0, 1, nx), p, linewidth=4, color=line_color)
-    ax.set_ylabel("Presiune p [Pa]", fontsize=label_size)
-    ax.set_xlabel("x [m]", fontsize=label_size)
-    ax.tick_params(axis='both', which='major', labelsize=tick_size)
-    ax.grid(True)
-    ax.set_xlim(left=0.0)
-    ax.set_ylim(bottom=0.0)
-    ax.set_aspect(ar)
-    plt.savefig(f"p_start.png")
-    # plt.clf()
-
-    fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
-    ax.plot(np.linspace(0, 1, nx), u, linewidth=4, color=line_color)
-    ax.set_ylabel("Viteza u [m/s]", fontsize=label_size)
-    ax.set_xlabel("x [m]", fontsize=label_size)
-    ax.tick_params(axis='both', which='major', labelsize=tick_size)
-    ax.grid(True)
-    ax.set_xlim(left=0.0)
-    ax.set_ylim(bottom=0.0)
-    ax.set_aspect(ar)
-    plt.savefig(f"u_start.png")
-    # plt.clf()
-
-    plt.show()
-    plt.clf()
-    t_list = np.append(t_list, t)
 
     while t < t_end:
-        dt = find_dt(U, A, dx, cfl=0.2)
+        dt = find_dt(U, A, dx, cfl)
         U[:, 3:nx-3, n+1] = step_RK3(U, U1, U2, A, dt, dx, n, nx)
         U = Riemann_BC(U, n+1)
         t += dt
@@ -402,48 +485,8 @@ def simulate():
         t_list = np.append(t_list, t)
         print(t)
 
-    #plot density, pressure, velocity at final time step
-    fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
-    ax.plot(rho, linewidth=4, color=line_color)
-    ax.set_ylabel("Densitate rho", fontsize=label_size)
-    ax.set_xlabel("x [m]", fontsize=label_size)
-    ax.legend(fontsize=legend_size)
-    ax.tick_params(axis='both', which='major', labelsize=tick_size)
-    ax.grid(True)
-    ax.set_xlim(left=0.0)
-    ax.set_ylim(bottom=0.0)
-    ax.set_aspect(ar)
-    plt.savefig(f"rho_end.png")
-    # plt.clf()
+    plot(U, A, n)
 
-    fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
-    ax.plot(p, linewidth=4, color=line_color)
-    ax.set_ylabel("Presiune p [Pa]", fontsize=label_size)
-    ax.set_xlabel("x [m]", fontsize=label_size)
-    ax.legend(fontsize=legend_size)
-    ax.tick_params(axis='both', which='major', labelsize=tick_size)
-    ax.grid(True)
-    ax.set_xlim(left=0.0)
-    ax.set_ylim(bottom=0.0)
-    ax.set_aspect(ar)
-    plt.savefig(f"p_end.png")
-    # plt.clf()
-
-    fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
-    ax.plot(u, linewidth=4, color=line_color)
-    ax.set_ylabel("Viteza u [m/s]", fontsize=label_size)
-    ax.set_xlabel("x [m]", fontsize=label_size)
-    ax.legend(fontsize=legend_size)
-    ax.tick_params(axis='both', which='major', labelsize=tick_size)
-    ax.grid(True)
-    ax.set_xlim(left=0.0)
-    ax.set_ylim(bottom=0.0)
-    ax.set_aspect(ar)
-    plt.savefig(f"u_end.png")
-    # plt.clf()
-
-    plt.show()
-    plt.clf()
 
 if __name__ == "__main__":
     simulate()
