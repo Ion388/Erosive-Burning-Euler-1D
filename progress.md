@@ -22,3 +22,6 @@ Termen limita 1-5: 10 aprilie (15 aprilie termen limita pentru incarcarea abstra
 - nozzle geometry (throat cross sectional area, exit cross sectional area)
 - flight profile - burning time, thrust developed over time (with corresponding ambient pressure over time), internal pressure over time if recorded, specific impulse (sea level or vacuum)
 - burnt gasses estimation - heat capacity ratio (gamma), specific heat (Cp), thermal conductivity, gas viscosity (mu)
+
+
+Measure-Command { & C:\Users\ionst\AppData\Local\Programs\Python\Python313\python.exe c:/Users/ionst/Documents/GitHub/Erosive-Burning-Euler-1D/Euler-1D/Riemann_solver.py } | Select-Object TotalSeconds

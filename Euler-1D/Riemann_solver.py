@@ -13,6 +13,12 @@ from __future__ import annotations
 import math
 import os
 import sys
+
+# Hint BLAS/OpenMP backends to use all CPU threads for vectorized kernels.
+os.environ.setdefault("OMP_NUM_THREADS", "16")
+os.environ.setdefault("MKL_NUM_THREADS", "16")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "16")
+
 import numpy as np
 from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
@@ -111,37 +117,6 @@ def simulate():
 
         eps = 1e-12
 
-        def eig_lr(UL: np.ndarray, UR: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-            rhoL = max(UL[0], eps)
-            uL = UL[1] / rhoL
-            EL = UL[2] / rhoL
-            pL = max(rhoL * (k - 1.0) * (EL - 0.5 * uL * uL), eps)
-            HL = EL + pL / rhoL
-
-            rhoR = max(UR[0], eps)
-            uR = UR[1] / rhoR
-            ER = UR[2] / rhoR
-            pR = max(rhoR * (k - 1.0) * (ER - 0.5 * uR * uR), eps)
-            HR = ER + pR / rhoR
-
-            sL = math.sqrt(rhoL)
-            sR = math.sqrt(rhoR)
-            denom = max(sL + sR, eps)
-
-            rhohat = sL * sR
-            uhat = (sL * uL + sR * uR) / denom
-            Hhat = (sL * HL + sR * HR) / denom
-            ahat2 = max((k - 1.0) * (Hhat - 0.5 * uhat * uhat), eps)
-            ahat = math.sqrt(ahat2)
-
-            Pmatrix = np.array([[1, rhohat/(2*ahat), rhohat/(2*ahat)],
-                                [uhat, rhohat*(uhat+ahat)/(2*ahat), rhohat*(uhat-ahat)/(2*ahat)],
-                                [uhat*uhat/2, rhohat*(Hhat+uhat*ahat)/(2*ahat), rhohat*(Hhat-uhat*ahat)/(2*ahat)]])
-
-            eigenvalues = np.array([uhat, uhat + ahat, uhat - ahat])
-            Pmatrix_inverse = np.linalg.inv(Pmatrix)
-            return Pmatrix_inverse, Pmatrix, eigenvalues
-
         def eno3_left_iphalf(w_im2, w_im1, w_i, w_ip1, w_ip2):
             p0 = (1.0 / 3.0) * w_im2 - (7.0 / 6.0) * w_im1 + (11.0 / 6.0) * w_i
             p1 = -(1.0 / 6.0) * w_im1 + (5.0 / 6.0) * w_i + (1.0 / 3.0) * w_ip1
@@ -190,47 +165,64 @@ def simulate():
 
             return w1*p0 + w2*p1 + w3*p2
 
-        nc = nx - 6
-        UL = np.zeros((nvar, nc+1), dtype=Ulast.dtype)
-        UR = np.zeros((nvar, nc+1), dtype=Ulast.dtype)
-        eigenvals = np.zeros((nvar, nc+1), dtype=Ulast.dtype)
+        m = nx - 5  # number of reconstructed interfaces
 
-        for j, ic in enumerate(range(3, nx - 2)):
-            u_im3 = Ulast[:, ic - 3]
-            u_im2 = Ulast[:, ic - 2]
-            u_im1 = Ulast[:, ic - 1]
-            u_i = Ulast[:, ic]
-            u_ip1 = Ulast[:, ic + 1]
-            u_ip2 = Ulast[:, ic + 2]
+        # Build all stencils at once to avoid Python-loop overhead.
+        u_im3 = Ulast[:, 0:m]
+        u_im2 = Ulast[:, 1:m+1]
+        u_im1 = Ulast[:, 2:m+2]
+        u_i = Ulast[:, 3:m+3]
+        u_ip1 = Ulast[:, 4:m+4]
+        u_ip2 = Ulast[:, 5:m+5]
 
-            L, R, eigenvals_j = eig_lr(u_im1, u_i)
+        rhoL = np.maximum(u_im1[0], eps)
+        velL = u_im1[1] / rhoL
+        EL = u_im1[2] / rhoL
+        pL = np.maximum(rhoL * (k - 1.0) * (EL - 0.5 * velL * velL), eps)
+        HL = EL + pL / rhoL
 
-            # Project stencil points to characteristic space (minus and plus interfaces)
-            wm_im3 = L @ u_im3
-            wm_im2 = L @ u_im2
-            wm_im1 = L @ u_im1
-            wm_i = L @ u_i
-            wm_ip1 = L @ u_ip1
-            wm_ip2 = L @ u_ip2
+        rhoR = np.maximum(u_i[0], eps)
+        velR = u_i[1] / rhoR
+        ER = u_i[2] / rhoR
+        pR = np.maximum(rhoR * (k - 1.0) * (ER - 0.5 * velR * velR), eps)
+        HR = ER + pR / rhoR
 
+        sL = np.sqrt(rhoL)
+        sR = np.sqrt(rhoR)
+        denom = np.maximum(sL + sR, eps)
 
-            w_uL = np.zeros(nvar, dtype=Ulast.dtype)
-            w_uR = np.zeros(nvar, dtype=Ulast.dtype)
+        rhohat = sL * sR
+        uhat = (sL * velL + sR * velR) / denom
+        Hhat = (sL * HL + sR * HR) / denom
+        ahat2 = np.maximum((k - 1.0) * (Hhat - 0.5 * uhat * uhat), eps)
+        ahat = np.sqrt(ahat2)
 
-            for pidx in range(nvar):
-                # UmL: U^- at x_{i-1/2} = left ENO3 at (i-1)+1/2
-                w_uL[pidx] = eno3_left_iphalf(
-                    wm_im3[pidx], wm_im2[pidx], wm_im1[pidx], wm_i[pidx], wm_ip1[pidx]
-                )
-                # UmR: U^+ at x_{i-1/2} = right ENO3 at (i-1)+1/2
-                w_uR[pidx] = eno3_right_iphalf(
-                    wm_im2[pidx], wm_im1[pidx], wm_i[pidx], wm_ip1[pidx], wm_ip2[pidx]
-                )
+        P = np.empty((m, 3, 3), dtype=Ulast.dtype)
+        P[:, 0, 0] = 1.0
+        P[:, 0, 1] = rhohat / (2.0 * ahat)
+        P[:, 0, 2] = rhohat / (2.0 * ahat)
+        P[:, 1, 0] = uhat
+        P[:, 1, 1] = rhohat * (uhat + ahat) / (2.0 * ahat)
+        P[:, 1, 2] = rhohat * (uhat - ahat) / (2.0 * ahat)
+        P[:, 2, 0] = 0.5 * uhat * uhat
+        P[:, 2, 1] = rhohat * (Hhat + uhat * ahat) / (2.0 * ahat)
+        P[:, 2, 2] = rhohat * (Hhat - uhat * ahat) / (2.0 * ahat)
 
+        L = np.linalg.inv(P)
+        eigenvals = np.vstack((uhat, uhat + ahat, uhat - ahat))
 
-            UL[:, j] = R @ w_uL
-            UR[:, j] = R @ w_uR 
-            eigenvals[:, j] = eigenvals_j
+        wm_im3 = np.einsum('mab,bm->am', L, u_im3)
+        wm_im2 = np.einsum('mab,bm->am', L, u_im2)
+        wm_im1 = np.einsum('mab,bm->am', L, u_im1)
+        wm_i = np.einsum('mab,bm->am', L, u_i)
+        wm_ip1 = np.einsum('mab,bm->am', L, u_ip1)
+        wm_ip2 = np.einsum('mab,bm->am', L, u_ip2)
+
+        w_uL = eno3_left_iphalf(wm_im3, wm_im2, wm_im1, wm_i, wm_ip1)
+        w_uR = eno3_right_iphalf(wm_im2, wm_im1, wm_i, wm_ip1, wm_ip2)
+
+        UL = np.einsum('mab,bm->am', P, w_uL)
+        UR = np.einsum('mab,bm->am', P, w_uR)
 
         return UL, UR, eigenvals
     
@@ -273,8 +265,8 @@ def simulate():
         base = base_num / base_den
         pstarr = np.power(base, power_exp)  # Toro's p* estimate at x_{i-1/2}
 
-        qL = [1 if pstarr[i] <= pL[i] else np.sqrt(1+(k+1)/(2*k)*(pstarr[i]/pL[i]-1)) for i in range(len(pL))]
-        qR = [1 if pstarr[i] <= pR[i] else np.sqrt(1+(k+1)/(2*k)*(pstarr[i]/pR[i]-1)) for i in range(len(pR))]
+        qL = np.where(pstarr <= pL, 1.0, np.sqrt(1.0 + (k + 1.0) / (2.0 * k) * (pstarr / pL - 1.0)))
+        qR = np.where(pstarr <= pR, 1.0, np.sqrt(1.0 + (k + 1.0) / (2.0 * k) * (pstarr / pR - 1.0)))
 
         SL = uL - aL*qL
         SR = uR + aR*qR
@@ -309,19 +301,18 @@ def simulate():
         fstarL = fL + SL * (UstarL - UL)
         fstarR = fR + SR * (UstarR - UR)
 
-        fm = np.zeros_like(UL)
-        fp = np.zeros_like(UR)
         f = np.zeros_like(UL)
 
-        for i in range(UL.shape[1]):
-            if SL[i] >= 0:
-                f[:, i] = fL[:, i]
-            elif SL[i] < 0 and Sstar[i] >= 0:
-                f[:, i] = fstarL[:, i]
-            elif SR[i] > 0 and Sstar[i] <= 0:
-                f[:, i] = fstarR[:, i]
-            elif SR[i] <= 0:
-                f[:, i] = fR[:, i]
+        # Vectorized HLLC state selection (replaces scalar Python loop).
+        mask_L = SL >= 0.0
+        mask_starL = (SL < 0.0) & (Sstar >= 0.0)
+        mask_starR = (SR > 0.0) & (Sstar <= 0.0)
+        mask_R = SR <= 0.0
+
+        f[:, mask_L] = fL[:, mask_L]
+        f[:, mask_starL] = fstarL[:, mask_starL]
+        f[:, mask_starR] = fstarR[:, mask_starR]
+        f[:, mask_R] = fR[:, mask_R]
 
         fm = f[:, :-1]  # flux at i-1/2
         fp = f[:, 1:]   # flux at i+1/2
@@ -337,50 +328,56 @@ def simulate():
     
     def SSPRK45(U, A, dt, dx, n, nx):
 
-        U1 = np.zeros((3, nx, 2000), dtype=np.float64)
-        U2 = np.zeros((3, nx, 2000), dtype=np.float64)
-        U3 = np.zeros((3, nx, 2000), dtype=np.float64)
-        U4 = np.zeros((3, nx, 2000), dtype=np.float64)
+        # Keep only one stage index to avoid huge allocations each time step.
+        U1 = np.zeros((3, nx, 1), dtype=np.float64)
+        U2 = np.zeros((3, nx, 1), dtype=np.float64)
+        U3 = np.zeros((3, nx, 1), dtype=np.float64)
+        U4 = np.zeros((3, nx, 1), dtype=np.float64)
+
+        U1[:, :, 0] = U[:, :, n]
+        U2[:, :, 0] = U[:, :, n]
+        U3[:, :, 0] = U[:, :, n]
+        U4[:, :, 0] = U[:, :, n]
 
         # shock reflection NOT depicted accurately for now due to sboundary conditions
         U = Riemann_BC(U, n)
         fm, fp = HLLC_flux(U, A, n)
         k1 = -1/dx * (fp - fm)
-        U1[:, 3:nx-3, n] = U[:, 3:nx-3, n] + 0.391752226571890*dt*k1
+        U1[:, 3:nx-3, 0] = U[:, 3:nx-3, n] + 0.391752226571890*dt*k1
 
-        U1 = Riemann_BC(U1, n)
-        fm, fp = HLLC_flux(U1, A, n)
+        U1 = Riemann_BC(U1, 0)
+        fm, fp = HLLC_flux(U1, A, 0)
         k2 = -1/dx * (fp - fm)
-        U2[:, 3:nx-3, n] = 0.444370493651235*U[:, 3:nx-3, n] + 0.555629506348765*U1[:, 3:nx-3, n] + 0.368410593050371*dt*k2
+        U2[:, 3:nx-3, 0] = 0.444370493651235*U[:, 3:nx-3, n] + 0.555629506348765*U1[:, 3:nx-3, 0] + 0.368410593050371*dt*k2
 
-        U2 = Riemann_BC(U2, n)
-        fm, fp = HLLC_flux(U2, A, n)
+        U2 = Riemann_BC(U2, 0)
+        fm, fp = HLLC_flux(U2, A, 0)
         k3 = -1/dx * (fp - fm)
-        U3[:, 3:nx-3, n] = 0.620101851488403*U[:, 3:nx-3, n] + 0.379898148511597*U2[:, 3:nx-3, n] + 0.251891774271694*dt*k3
+        U3[:, 3:nx-3, 0] = 0.620101851488403*U[:, 3:nx-3, n] + 0.379898148511597*U2[:, 3:nx-3, 0] + 0.251891774271694*dt*k3
 
-        U3 = Riemann_BC(U3, n)
-        fm, fp = HLLC_flux(U3, A, n)
+        U3 = Riemann_BC(U3, 0)
+        fm, fp = HLLC_flux(U3, A, 0)
         k4 = -1/dx * (fp - fm)
-        U4[:, 3:nx-3, n] = 0.178079954393132*U[:, 3:nx-3, n] + 0.821920045606868*U3[:, 3:nx-3, n] +  0.544974750228521*dt*k4
+        U4[:, 3:nx-3, 0] = 0.178079954393132*U[:, 3:nx-3, n] + 0.821920045606868*U3[:, 3:nx-3, 0] +  0.544974750228521*dt*k4
 
-        U4 = Riemann_BC(U4, n)
-        fm, fp = HLLC_flux(U4, A, n)
+        U4 = Riemann_BC(U4, 0)
+        fm, fp = HLLC_flux(U4, A, 0)
         k5 = -1/dx * (fp - fm)
-        Unp1 = 0.517231671970585*U2[:, 3:nx-3, n] + 0.096059710526147*U3[:, 3:nx-3, n] + 0.063692468666290*dt*k4 + 0.386708617503268*U4[:, 3:nx-3, n] + 0.226007483236906*dt*k5
+        Unp1 = 0.517231671970585*U2[:, 3:nx-3, 0] + 0.096059710526147*U3[:, 3:nx-3, 0] + 0.063692468666290*dt*k4 + 0.386708617503268*U4[:, 3:nx-3, 0] + 0.226007483236906*dt*k5
 
         return Unp1
     
     def plot(U, A, n):
 
-        # rho, u, p, E, a = primitives(U, A, n)
+        rho, u, p, E, a = primitives(U, A, n)
 
         os.makedirs(f"cfl{cfl}_{wave_speed_method}", exist_ok=True)
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
-        for i in range(0, n+1, max(1, n//10)):
-            rho_i, u_i, p_i, _, _ = primitives(U, A, i)
-            ax.plot(rho_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
-        # ax.plot(rho, linewidth=4, color=line_color)
+        # for i in range(0, n+1, max(1, n//10)):
+        #     rho_i, u_i, p_i, _, _ = primitives(U, A, i)
+        #     ax.plot(rho_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
+        ax.plot(rho, linewidth=4, color=line_color)
         ax.set_ylabel("Densitate rho", fontsize=label_size)
         ax.set_xlabel("x [m]", fontsize=label_size)
         ax.tick_params(axis='both', which='major', labelsize=tick_size)
@@ -392,10 +389,10 @@ def simulate():
         # plt.clf()
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
-        for i in range(0, n+1, max(1, n//10)):
-            rho_i, u_i, p_i, _, _ = primitives(U, A, i)
-            ax.plot(p_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
-        # ax.plot(p, linewidth=4, color=line_color)
+        # for i in range(0, n+1, max(1, n//10)):
+        #     rho_i, u_i, p_i, _, _ = primitives(U, A, i)
+        #     ax.plot(p_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
+        ax.plot(p, linewidth=4, color=line_color)
         ax.set_ylabel("Presiune p [Pa]", fontsize=label_size)
         ax.set_xlabel("x [m]", fontsize=label_size)
         ax.tick_params(axis='both', which='major', labelsize=tick_size)
@@ -407,16 +404,16 @@ def simulate():
         # plt.clf()
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
-        for i in range(0, n+1, max(1, n//10)):
-            rho_i, u_i, p_i, _, _ = primitives(U, A, i)
-            ax.plot(u_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
-        # ax.plot(u, linewidth=4, color=line_color)
+        # for i in range(0, n+1, max(1, n//10)):
+        #     rho_i, u_i, p_i, _, _ = primitives(U, A, i)
+        #     ax.plot(u_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
+        ax.plot(u, linewidth=4, color=line_color)
         ax.set_ylabel("Viteza u [m/s]", fontsize=label_size)
         ax.set_xlabel("x [m]", fontsize=label_size)
         ax.tick_params(axis='both', which='major', labelsize=tick_size)
         ax.grid(True)
         ax.set_xlim(left=0.0)
-        ax.set_ylim(bottom=0.0)
+        # ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
         plt.savefig(f"cfl{cfl}_{wave_speed_method}/u_end.png")
         # plt.clf()
@@ -431,16 +428,16 @@ def simulate():
     t_end = 6e-4
     nx = 600
     dx = 1 / (nx - 6)
-    cfl = 1
+    cfl = 0.9
     wave_speed_method = 'Toro'  # 'Dava' or 'Toro'
+    print_progress = False
 
     # Variables to track over time
     U = np.zeros((3, nx, 2000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step
     A = np.ones([1])  # test cross-sectional area
 
     # Outputs
-    t_list = np.array([], dtype=np.float64)
-    t_list = np.append(t_list, t)
+    t_list = [t]
     
     n = 0
     U = initial_Riemann(U, A, n)
@@ -454,10 +451,12 @@ def simulate():
         n += 1
 
         # Store outputs
-        t_list = np.append(t_list, t)
-        print(t)
+        t_list.append(t)
+        if print_progress:
+            print(t)
         # print(dt)
 
+    t_list = np.asarray(t_list, dtype=np.float64)
     U = U[:, :, :n+1]
     plot(U, A, n)
 
