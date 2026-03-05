@@ -1,10 +1,13 @@
 ### DE RESCRIS INFO DESPRE PROGRAM ###
-# Notes:
-# - All units SI. Time in seconds, Pa, m, kg.
-# 1 = chamber
-# 2 = nozzle exit
-# 3/t = throat
-# amb = ambient
+# Acest cod simulează ecuațiile Euler 1D pentru o problemă Riemann.
+# Codul inițializează o problemă Riemann cu o discontinuitate în densitate și presiune, aplică condiții la margine reflective și afișează
+#   profilurile finale de densitate, presiune și viteză la sfârșitul simulării.
+# Functionalitati principale: 
+# - Reconstrucție WENO5 caracteristică pentru variabilele conservate
+# - Estimări ale vitezei maxime de undă folosind metodele Davidson și Toro (Toro superior, putin mai costisitor)
+# - Flux HLLC folosit pentru calculul fluxurilor numerice
+# - Pas de timp dt calculat dupa fiecare iteratie
+# - Metoda de integrare în timp SSPRK45 pentru avansarea soluției în timp (5 pasi, aproape dublu costul RK3)
 
 from __future__ import annotations
 import math
@@ -323,7 +326,7 @@ def simulate():
         fm = f[:, :-1]  # flux at i-1/2
         fp = f[:, 1:]   # flux at i+1/2
 
-        return fm, fp # flux at i-1/2 and i+1/2
+        return fm, fp
 
     def find_dt(U, A, dx, cfl):
         if wave_speed_method == 'Dava':
@@ -332,7 +335,12 @@ def simulate():
             llam = max_wave_speed_Toro(U, A, n, case='dt') # Toro
         return cfl * dx / llam if llam > 0 else 1e-6
     
-    def SSPRK45(U, U1, U2, U3, U4, A, dt, dx, n, nx):
+    def SSPRK45(U, A, dt, dx, n, nx):
+
+        U1 = np.zeros((3, nx, 2000), dtype=np.float64)
+        U2 = np.zeros((3, nx, 2000), dtype=np.float64)
+        U3 = np.zeros((3, nx, 2000), dtype=np.float64)
+        U4 = np.zeros((3, nx, 2000), dtype=np.float64)
 
         # shock reflection NOT depicted accurately for now due to sboundary conditions
         U = Riemann_BC(U, n)
@@ -364,12 +372,15 @@ def simulate():
     
     def plot(U, A, n):
 
-        rho, u, p, E, a = primitives(U, A, n)
+        # rho, u, p, E, a = primitives(U, A, n)
 
-        os.makedirs(f"cfl{cfl}_beta{beta}_{wave_speed_method}", exist_ok=True)
+        os.makedirs(f"cfl{cfl}_{wave_speed_method}", exist_ok=True)
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
-        ax.plot(rho, linewidth=4, color=line_color)
+        for i in range(0, n+1, max(1, n//10)):
+            rho_i, u_i, p_i, _, _ = primitives(U, A, i)
+            ax.plot(rho_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
+        # ax.plot(rho, linewidth=4, color=line_color)
         ax.set_ylabel("Densitate rho", fontsize=label_size)
         ax.set_xlabel("x [m]", fontsize=label_size)
         ax.tick_params(axis='both', which='major', labelsize=tick_size)
@@ -377,11 +388,14 @@ def simulate():
         ax.set_xlim(left=0.0)
         ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
-        plt.savefig(f"cfl{cfl}_beta{beta}_{wave_speed_method}/rho_end.png")
+        plt.savefig(f"cfl{cfl}_{wave_speed_method}/rho_end.png")
         # plt.clf()
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
-        ax.plot(p, linewidth=4, color=line_color)
+        for i in range(0, n+1, max(1, n//10)):
+            rho_i, u_i, p_i, _, _ = primitives(U, A, i)
+            ax.plot(p_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
+        # ax.plot(p, linewidth=4, color=line_color)
         ax.set_ylabel("Presiune p [Pa]", fontsize=label_size)
         ax.set_xlabel("x [m]", fontsize=label_size)
         ax.tick_params(axis='both', which='major', labelsize=tick_size)
@@ -389,11 +403,14 @@ def simulate():
         ax.set_xlim(left=0.0)
         ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
-        plt.savefig(f"cfl{cfl}_beta{beta}_{wave_speed_method}/p_end.png")
+        plt.savefig(f"cfl{cfl}_{wave_speed_method}/p_end.png")
         # plt.clf()
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
-        ax.plot(u, linewidth=4, color=line_color)
+        for i in range(0, n+1, max(1, n//10)):
+            rho_i, u_i, p_i, _, _ = primitives(U, A, i)
+            ax.plot(u_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
+        # ax.plot(u, linewidth=4, color=line_color)
         ax.set_ylabel("Viteza u [m/s]", fontsize=label_size)
         ax.set_xlabel("x [m]", fontsize=label_size)
         ax.tick_params(axis='both', which='major', labelsize=tick_size)
@@ -401,7 +418,7 @@ def simulate():
         ax.set_xlim(left=0.0)
         ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
-        plt.savefig(f"cfl{cfl}_beta{beta}_{wave_speed_method}/u_end.png")
+        plt.savefig(f"cfl{cfl}_{wave_speed_method}/u_end.png")
         # plt.clf()
     
     # Main simulation loop
@@ -414,16 +431,11 @@ def simulate():
     t_end = 6e-4
     nx = 600
     dx = 1 / (nx - 6)
-    cfl = 0.9
-    beta = 1  # Rusanov parameter, can be tuned for stability/dissipation
+    cfl = 1
     wave_speed_method = 'Toro'  # 'Dava' or 'Toro'
 
     # Variables to track over time
     U = np.zeros((3, nx, 2000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step
-    U1 = np.zeros((3, nx, 2000), dtype=np.float64)
-    U2 = np.zeros((3, nx, 2000), dtype=np.float64)
-    U3 = np.zeros((3, nx, 2000), dtype=np.float64)
-    U4 = np.zeros((3, nx, 2000), dtype=np.float64)
     A = np.ones([1])  # test cross-sectional area
 
     # Outputs
@@ -436,16 +448,17 @@ def simulate():
 
     while t < t_end:
         dt = find_dt(U, A, dx, cfl)
-        U[:, 3:nx-3, n+1] = SSPRK45(U, U1, U2, U3, U4, A, dt, dx, n, nx)
+        U[:, 3:nx-3, n+1] = SSPRK45(U, A, dt, dx, n, nx)
         U = Riemann_BC(U, n+1)
         t += dt
         n += 1
 
         # Store outputs
-        rho, u, p, E, a = primitives(U, A, n)
         t_list = np.append(t_list, t)
         print(t)
+        # print(dt)
 
+    U = U[:, :, :n+1]
     plot(U, A, n)
 
 

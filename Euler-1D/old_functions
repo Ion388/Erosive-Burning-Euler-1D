@@ -233,7 +233,10 @@
         return Amatrices
 
 #### OLD RK3 STEP ####
-    def step_RK3(U, U1, U2, A, dt, dx, n, nx):
+    def step_RK3(U, A, dt, dx, n, nx):
+
+        U1 = np.zeros((3, nx, 2000), dtype=np.float64)
+        U2 = np.zeros((3, nx, 2000), dtype=np.float64)
 
         # shock reflection NOT depicted accurately for now due to sboundary conditions
         U = Riemann_BC(U, n)
