@@ -26,33 +26,6 @@ line_color = 'orangered'
 
 
 def simulate():
-    rho_floor = 1e-10
-    p_floor = 1e-8
-
-    def enforce_positivity(Uarr, n_idt, nx_local):
-        rho = np.maximum(Uarr[0, :, n_idt], rho_floor)
-        mom = Uarr[1, :, n_idt]
-        Et = Uarr[2, :, n_idt]
-
-        kinetic = 0.5 * mom * mom / rho
-        Et_min = kinetic + p_floor / (k - 1.0)
-
-        Uarr[0, :, n_idt] = rho
-        Uarr[2, :, n_idt] = np.maximum(Et, Et_min)
-        return Uarr
-
-    def enforce_positivity_slice(U_slice):
-        rho = np.maximum(U_slice[0, :], rho_floor)
-        mom = U_slice[1, :]
-        Et = U_slice[2, :]
-
-
-        kinetic = 0.5 * mom * mom / rho
-        Et_min = kinetic + p_floor / (k - 1.0)
-
-        U_slice[0, :] = rho
-        U_slice[2, :] = np.maximum(Et, Et_min)
-        return U_slice
     
     def primitives(U, A, n):
         """Convert conserved variables U to primitive variables (rho, u, p, E, a).
@@ -60,16 +33,16 @@ def simulate():
         """
         A_place = 1
         if U.ndim == 3:
-            rho = np.maximum(U[0, :, n], rho_floor)
+            rho = U[0, :, n]
             u   = U[1, :, n] / rho
             E   = U[2, :, n] / rho     # total specific energy (per unit mass)
         else:
-            rho = np.maximum(U[0, :], rho_floor)
+            rho = U[0, :]
             u   = U[1, :] / rho
             E   = U[2, :] / rho    # total specific energy (per unit mass)
         
-        p = np.maximum(rho * (k - 1.0) * (E - 0.5 * u*u), p_floor)
-        a = np.sqrt(np.maximum(k * p / rho, 0.0))
+        p = rho * (k - 1.0) * (E - 0.5 * u*u)
+        a = np.sqrt(k * p / rho)
         return rho, u, p, E, a
     
     def initial_Riemann(U, A, n):
@@ -114,10 +87,10 @@ def simulate():
         Ulast[1, -3] = -Ulast[1, -4]  # right ghost cell 3 (can be same as first for simplicity)
         U[:, :, n] = Ulast  # update U with new BCs for current time step
         return U
-
-    def eno3_reconstruct(U, n):
+    
+    def weno5_reconstruct(U, n):
         """
-        Characteristic ENO3 reconstruction for 1D Euler variables.
+        Characteristic WENO5 reconstruction for 1D Euler variables.
 
         U shape: (nvar, nx, nt), with at least 3 ghost cells on each side.
         Returns arrays with shape (nvar, nx-6), for i = 3..nx-4:
@@ -129,9 +102,9 @@ def simulate():
         nvar, nx, nt = U.shape
         Ulast = U[:, :, n]  # current time step
         if nx < 7:
-            raise ValueError("Need at least 7 points (including ghost cells) for ENO3.")
+            raise ValueError("Need at least 7 points (including ghost cells) for WENO5.")
         if nvar != 3:
-            raise ValueError("Characteristic ENO3 here is implemented for 1D Euler with 3 conserved variables.")
+            raise ValueError("Characteristic WENO5 here is implemented for 1D Euler with 3 conserved variables.")
 
         eps = 1e-12
 
@@ -171,22 +144,48 @@ def simulate():
             p1 = -(1.0 / 6.0) * w_im1 + (5.0 / 6.0) * w_i + (1.0 / 3.0) * w_ip1
             p2 = (1.0 / 3.0) * w_i + (5.0 / 6.0) * w_ip1 - (1.0 / 6.0) * w_ip2
 
-            b0 = abs(w_im2 - 2.0 * w_im1 + w_i)
-            b1 = abs(w_im1 - 2.0 * w_i + w_ip1)
-            b2 = abs(w_i - 2.0 * w_ip1 + w_ip2)
-            s = int(np.argmin([b0, b1, b2]))
-            return [p0, p1, p2][s]
+            gamma1 = 1/10
+            gamma2 = 3/5
+            gamma3 = 3/10
+
+            beta1 = (13/12)*(w_im2 - 2*w_im1 + w_i)**2 + (1/4)*(w_im2 - 4*w_im1 + 3*w_i)**2
+            beta2 = (13/12)*(w_im1 - 2*w_i + w_ip1)**2 + (1/4)*(w_im1 - w_ip1)**2
+            beta3 = (13/12)*(w_i - 2*w_ip1 + w_ip2)**2 + (1/4)*(3*w_i - 4*w_ip1 + w_ip2)**2
+
+            eps_weno = 1e-6
+            alpha1 = gamma1/(eps_weno + beta1)**2
+            alpha2 = gamma2/(eps_weno + beta2)**2
+            alpha3 = gamma3/(eps_weno + beta3)**2
+
+            w1 = alpha1/(alpha1+alpha2+alpha3)
+            w2 = alpha2/(alpha1+alpha2+alpha3)
+            w3 = alpha3/(alpha1+alpha2+alpha3)
+
+            return w1*p0 + w2*p1 + w3*p2
 
         def eno3_right_iphalf(w_im1, w_i, w_ip1, w_ip2, w_ip3):
             p0 = -(1.0 / 6.0) * w_im1 + (5.0 / 6.0) * w_i + (1.0 / 3.0) * w_ip1
             p1 = (1.0 / 3.0) * w_i + (5.0 / 6.0) * w_ip1 - (1.0 / 6.0) * w_ip2
             p2 = (11.0 / 6.0) * w_ip1 - (7.0 / 6.0) * w_ip2 + (1.0 / 3.0) * w_ip3
 
-            b0 = abs(w_im1 - 2.0 * w_i + w_ip1)
-            b1 = abs(w_i - 2.0 * w_ip1 + w_ip2)
-            b2 = abs(w_ip1 - 2.0 * w_ip2 + w_ip3)
-            s = int(np.argmin([b0, b1, b2]))
-            return [p0, p1, p2][s]
+            gamma1 = 3/10
+            gamma2 = 3/5
+            gamma3 = 1/10
+
+            beta1 = (13/12)*(w_im1 - 2*w_i + w_ip1)**2 + (1/4)*(3*w_im1 - 4*w_i + w_ip1)**2
+            beta2 = (13/12)*(w_i - 2*w_ip1 + w_ip2)**2 + (1/4)*(w_i - w_ip2)**2
+            beta3 = (13/12)*(w_ip1 - 2*w_ip2 + w_ip3)**2 + (1/4)*(w_ip1 - 4*w_ip2 + 3*w_ip3)**2
+
+            eps_weno = 1e-6
+            alpha1 = gamma1/(eps_weno + beta1)**2
+            alpha2 = gamma2/(eps_weno + beta2)**2
+            alpha3 = gamma3/(eps_weno + beta3)**2
+
+            w1 = alpha1/(alpha1+alpha2+alpha3)
+            w2 = alpha2/(alpha1+alpha2+alpha3)
+            w3 = alpha3/(alpha1+alpha2+alpha3)
+
+            return w1*p0 + w2*p1 + w3*p2
 
         nc = nx - 6
         UL = np.zeros((nvar, nc+1), dtype=Ulast.dtype)
@@ -220,7 +219,7 @@ def simulate():
                 w_uL[pidx] = eno3_left_iphalf(
                     wm_im3[pidx], wm_im2[pidx], wm_im1[pidx], wm_i[pidx], wm_ip1[pidx]
                 )
-                # UmR: U^+ at x_{i-1/2}
+                # UmR: U^+ at x_{i-1/2} = right ENO3 at (i-1)+1/2
                 w_uR[pidx] = eno3_right_iphalf(
                     wm_im2[pidx], wm_im1[pidx], wm_i[pidx], wm_ip1[pidx], wm_ip2[pidx]
                 )
@@ -234,45 +233,41 @@ def simulate():
     
     # Wave speed
     # Option 1 (very simple): max local characteristic speed from primitives
-    def max_wave_speed(U, A, n, case):
-        UL, UR, eigenvalues = eno3_reconstruct(U, n)
-        # _, uL, _, _, aL = primitives(UL, A, n)
-        # _, uR, _, _, aR = primitives(UR, A, n)
-        # alpha = [np.abs(uL) + aL, np.abs(uR) + aR]
-        alpha = np.abs(eigenvalues)  # max eigenvalue magnitude at each interface
+    def max_wave_speed_Dava(U, A, n, case):
+        UL, UR, _ = weno5_reconstruct(U, n)
+        _, uL, _, _, aL = primitives(UL, A, n)
+        _, uR, _, _, aR = primitives(UR, A, n)
+        SL = uL - aL
+        SR = uR + aR
 
         if case == 'dt':
-            return np.max(alpha)
+            return np.max(np.abs([SL, SR]))
         elif case == 'flux':
-            return np.max(alpha, axis=0)
+            return SL, SR
+    
+    def max_wave_speed_Davb(U, A, n, case):
+        UL, UR, _ = weno5_reconstruct(U, n)
+        _, uL, _, _, aL = primitives(UL, A, n)
+        _, uR, _, _, aR = primitives(UR, A, n)
+        SL = np.min([uL - aL, uR - aR], axis=0)
+        SR = np.max([uL + aL, uR + aR], axis=0)
+
+        if case == 'dt':
+            return np.max(np.abs([SL, SR]))
+        elif case == 'flux':
+            return SL, SR
 
     def max_wave_speed_Toro(U, A, n, case):
-        UL, UR, eigenvals = eno3_reconstruct(U, n)
+        UL, UR, _ = weno5_reconstruct(U, n)
 
         _, uL, pL, _, aL = primitives(UL, A, n)  # primitives at x_{i-1/2} left state
         _, uR, pR, _, aR = primitives(UR, A, n)  # primitives at x_{i-1/2} right state
 
-        if np.any(pL <= 0) or np.any(pR <= 0):
-            raise ValueError("Non-positive pressure before Toro p* estimate in max_wave_speed_Toro.")
-
         gamma_exp = (k - 1) / (2 * k)
         power_exp = 2 * k / (k - 1)
-
         base_num = aL + aR - 0.5 * (k - 1) * (uR - uL)
         base_den = aL / (pL ** gamma_exp) + aR / (pR ** gamma_exp)
-
-        if np.any(base_den <= 0):
-            raise ValueError("Non-positive denominator in Toro p* estimate in max_wave_speed_Toro.")
-
         base = base_num / base_den
-
-        if np.any(~np.isfinite(base)):
-            raise ValueError("Non-finite Toro p* base in max_wave_speed_Toro.")
-        if np.any(base <= 0):
-            raise ValueError(
-                f"Non-positive Toro p* base in max_wave_speed_Toro: min(base)={np.min(base)}"
-            )
-
         pstarr = np.power(base, power_exp)  # Toro's p* estimate at x_{i-1/2}
 
         qL = [1 if pstarr[i] <= pL[i] else np.sqrt(1+(k+1)/(2*k)*(pstarr[i]/pL[i]-1)) for i in range(len(pL))]
@@ -284,58 +279,26 @@ def simulate():
         if case == 'dt':
             return np.max(np.abs([SL, SR]))
         elif case == 'flux':
-            return np.max(np.abs([SL, SR]), axis=0)
+            return SL, SR
     
 
     def Amatrices(U, A, n):
-        rho, u, p, E, a = primitives(U, A, n)
+        _, u, _, E, _ = primitives(U, A, n)
         U_shape = U.shape
         Amatrices = np.zeros((3, 3, U_shape[1]))  # (nvar, nvar, nx)
         for i in range(U_shape[1]):
             Amatrices[:, :, i] = np.array([[0, 1, 0],
                         [0.5*(k-3)*u[i]**2, (3-k)*u[i], k-1],
-                        [u[i]*(0.5*(k-1)*u[i]**2 - k*E[i]), E[i]*k - 3/2*(k-1)*u[i]**2, k*u[i]]])
+                        [u[i]*((k-1)*u[i]**2 - k*E[i]), E[i]*k - 3/2*(k-1)*u[i]**2, k*u[i]]])
         return Amatrices
 
-    def Rusanov_flux(U, A, n):
-
-        UL, UR, eigenvals = eno3_reconstruct(U, n)
-
-        # print("UL:", UL)
-        # print("UR:", UR)
-
-        # for i in range(UL.shape[1]-1):
-        #     if np.all(UL[:, i+1] == UR[:, i]):
-        #         print(f"Warning: UL and UR are identical at index {i}, which may cause zero wave speed and excessive dissipation in Rusanov flux.")
-
-        if wave_speed_method == 'simple':
-            alpha = max_wave_speed(U, A, n, case='flux')  # Simple max wave speeds at x_{i-1/2} and x_{i+1/2}
-
-        elif wave_speed_method == 'Toro':
-            alpha = max_wave_speed_Toro(U, A, n, case='flux')  # Toro's max wave speeds at x_{i-1/2} and x_{i+1/2}
-            
-        AL = Amatrices(UL, A, n)
-        AR = Amatrices(UR, A, n)
-
-        f = np.zeros_like(UL)
-
-        for i in range(UL.shape[1]):
-            f[:, i] = 0.5 * (AL[:, :, i] @ UL[:, i] + AR[:, :, i] @ UR[:, i]) - 0.5 * beta * alpha[i] * (UR[:, i] - UL[:, i])
-
-        fm = f[:, :-1]  # flux at i-1/2
-        fp = f[:, 1:]   # flux at i+1/2
-
-        return fm, fp # flux at i-1/2 and i+1/2
     
-    def HLL_flux(U, A, n):
-        UL, UR, eigenvals = eno3_reconstruct(U, n)
 
-        if wave_speed_method == 'simple':
-            alpha = max_wave_speed(U, A, n, case='flux')  # Simple max wave speeds at x_{i-1/2} and x_{i+1/2}
+    def HLLC_flux(U, A, n):
+        UL, UR, eigenvals = weno5_reconstruct(U, n)
+        rhoL, uL, pL, EL, aL = primitives(UL, A, n)  # primitives at left state
+        rhoR, uR, pR, ER, aR = primitives(UR, A, n)  # primitives at right state
 
-        elif wave_speed_method == 'Toro':
-            alpha = max_wave_speed_Toro(U, A, n, case='flux')  # Toro's max wave speeds at x_{i-1/2} and x_{i+1/2}
-            
         AL = Amatrices(UL, A, n)
         AR = Amatrices(UR, A, n)
 
@@ -346,8 +309,18 @@ def simulate():
             fL[:, i] = AL[:, :, i] @ UL[:, i]
             fR[:, i] = AR[:, :, i] @ UR[:, i]
 
-        SL = np.minimum(np.min(eigenvals, axis=0), 0)  # Davidson's HLL wave speed estimates
-        SR = np.maximum(np.max(eigenvals, axis=0), 0)  # Davidson's HLL wave speed estimates
+        if wave_speed_method == 'Dava':
+            SL = np.minimum(np.min(eigenvals, axis=0), 0)  # Davidson's HLL wave speed estimates
+            SR = np.maximum(np.max(eigenvals, axis=0), 0)  # Davidson's HLL wave speed estimates
+        elif wave_speed_method == 'Toro':
+            SL, SR = max_wave_speed_Toro(U, A, n, case='flux')  # Toro's max wave speeds at x_{i-1/2} and x_{i+1/2}
+
+        Sstar = (pR - pL + rhoL*uL*(SL-uL) - rhoR*uR*(SR-uR))/(rhoL*(SL-uL) - rhoR*(SR-uR))
+
+        UstarL = rhoL * (SL - uL) / (SL - Sstar) * np.array([np.ones(SL.shape), Sstar, EL + (Sstar - uL)*(Sstar + pL/(rhoL*(SL-uL)))])
+        UstarR = rhoR * (SR - uR) / (SR - Sstar) * np.array([np.ones(SL.shape), Sstar, ER + (Sstar - uR)*(Sstar + pR/(rhoR*(SR-uR)))])
+        fstarL = fL + SL * (UstarL - UL)
+        fstarR = fR + SR * (UstarR - UR)
 
         fm = np.zeros_like(UL)
         fp = np.zeros_like(UR)
@@ -356,52 +329,44 @@ def simulate():
         for i in range(UL.shape[1]):
             if SL[i] >= 0:
                 f[:, i] = fL[:, i]
-                # fp[:, i] = fL[:, i]
+            elif SL[i] < 0 and Sstar[i] >= 0:
+                f[:, i] = fstarL[:, i]
+            elif SR[i] > 0 and Sstar[i] <= 0:
+                f[:, i] = fstarR[:, i]
             elif SR[i] <= 0:
                 f[:, i] = fR[:, i]
-                # fp[:, i] = fR[:, i]
-            else:
-                f[:, i] = (SR[i]*fL[:, i] - SL[i]*fR[:, i] + SL[i]*SR[i]*(UR[:, i] - UL[:, i])) / (SR[i] - SL[i])
-                # fp[:, i] = fm[:, i]
 
         fm = f[:, :-1]  # flux at i-1/2
         fp = f[:, 1:]   # flux at i+1/2
 
-        # print(fm.shape)
         return fm, fp # flux at i-1/2 and i+1/2
 
-    def HLLC_flux(U, A, n):
-        UL, UR, eigenvals = eno3_reconstruct(U, n)
-    
     def find_dt(U, A, dx, cfl):
-        if wave_speed_method == 'simple':
-            llam = max_wave_speed(U, A, n, case='dt')  # Simple
+        if wave_speed_method == 'Dava':
+            llam = max_wave_speed_Dava(U, A, n, case='dt')  # Simple
         elif wave_speed_method == 'Toro':
             llam = max_wave_speed_Toro(U, A, n, case='dt') # Toro
         return cfl * dx / llam if llam > 0 else 1e-6
     
     def step_RK3(U, U1, U2, A, dt, dx, n, nx):
 
-        # shock reflection NOT depicted accurately for now
+        # shock reflection NOT depicted accurately for now due to sboundary conditions
         U = Riemann_BC(U, n)
-        U = enforce_positivity(U, n, nx)
-        fm, fp = HLL_flux(U, A, n)
+        fm, fp = HLLC_flux(U, A, n)
         k1 = -1/dx * (fp - fm)
         U1[:, 3:nx-3, n] = U[:, 3:nx-3, n] + dt*k1
 
         U1 = Riemann_BC(U1, n)
-        U1 = enforce_positivity(U1, n, nx)
-        fm, fp = HLL_flux(U1, A, n)
+        fm, fp = HLLC_flux(U1, A, n)
         k2 = -1/dx * (fp - fm)
         U2[:, 3:nx-3, n] = 0.75*U[:, 3:nx-3, n] + 0.25*(U1[:, 3:nx-3, n] + dt*k2)
 
         U2 = Riemann_BC(U2, n)
-        U2 = enforce_positivity(U2, n, nx)
-        fm, fp = HLL_flux(U2, A, n)
+        fm, fp = HLLC_flux(U2, A, n)
         k3 = -1/dx * (fp - fm)
         Unp1 = (1/3)*U[:, 3:nx-3, n] + (2/3)*(U2[:, 3:nx-3, n] + dt*k3)
 
-        return enforce_positivity_slice(Unp1)
+        return Unp1
     
     def plot(U, A, n):
 
@@ -457,7 +422,7 @@ def simulate():
     dx = 1 / (nx - 6)
     cfl = 0.9
     beta = 1  # Rusanov parameter, can be tuned for stability/dissipation
-    wave_speed_method = 'simple'  # 'simple' or 'Toro'
+    wave_speed_method = 'Toro'  # 'Dava' or 'Toro'
 
     # Variables to track over time
     U = np.zeros((3, nx, 2000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step

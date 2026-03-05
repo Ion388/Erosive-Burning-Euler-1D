@@ -1,0 +1,221 @@
+#### OLD CLIPPING FUNCTIONS ####    
+    def enforce_positivity(Uarr, n_idt, nx_local):
+        # rho = np.maximum(Uarr[0, :, n_idt], rho_floor)
+        mom = Uarr[1, :, n_idt]
+        Et = Uarr[2, :, n_idt]
+        index = np.where(Uarr[0, :, n_idt] < 0)
+        if np.any(Uarr[0, :, n_idt] < 0):
+            print(index)
+
+        kinetic = 0.5 * mom * mom / rho
+        Et_min = kinetic + p_floor / (k - 1.0)
+
+        Uarr[0, :, n_idt] = rho
+        Uarr[2, :, n_idt] = np.maximum(Et, Et_min)
+        return Uarr
+
+    def enforce_positivity_slice(U_slice):
+        rho = np.maximum(U_slice[0, :], rho_floor)
+        mom = U_slice[1, :]
+        Et = U_slice[2, :]
+        index = np.where(U_slice[0, :] < 0)
+        if np.any(U_slice[0, :] < 0):
+            print(index)
+
+        kinetic = 0.5 * mom * mom / rho
+        Et_min = kinetic + p_floor / (k - 1.0)
+
+        U_slice[0, :] = rho
+        U_slice[2, :] = np.maximum(Et, Et_min)
+        return U_slice    
+
+
+#### OLD ENO3 RECONSTRUCTION ####
+    def eno3_reconstruct(U, n):
+        """
+        Characteristic ENO3 reconstruction for 1D Euler variables.
+
+        U shape: (nvar, nx, nt), with at least 3 ghost cells on each side.
+        Returns arrays with shape (nvar, nx-6), for i = 3..nx-4:
+        - UmL: U^- at x_{i-1/2}
+        - UmR: U^+ at x_{i-1/2}
+        - UpL: U^- at x_{i+1/2}
+        - UpR: U^+ at x_{i+1/2}
+        """
+        nvar, nx, nt = U.shape
+        Ulast = U[:, :, n]  # current time step
+        if nx < 7:
+            raise ValueError("Need at least 7 points (including ghost cells) for ENO3.")
+        if nvar != 3:
+            raise ValueError("Characteristic ENO3 here is implemented for 1D Euler with 3 conserved variables.")
+
+        eps = 1e-12
+
+        def eig_lr(UL: np.ndarray, UR: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            rhoL = max(UL[0], eps)
+            uL = UL[1] / rhoL
+            EL = UL[2] / rhoL
+            pL = max(rhoL * (k - 1.0) * (EL - 0.5 * uL * uL), eps)
+            HL = EL + pL / rhoL
+
+            rhoR = max(UR[0], eps)
+            uR = UR[1] / rhoR
+            ER = UR[2] / rhoR
+            pR = max(rhoR * (k - 1.0) * (ER - 0.5 * uR * uR), eps)
+            HR = ER + pR / rhoR
+
+            sL = math.sqrt(rhoL)
+            sR = math.sqrt(rhoR)
+            denom = max(sL + sR, eps)
+
+            rhohat = sL * sR
+            uhat = (sL * uL + sR * uR) / denom
+            Hhat = (sL * HL + sR * HR) / denom
+            ahat2 = max((k - 1.0) * (Hhat - 0.5 * uhat * uhat), eps)
+            ahat = math.sqrt(ahat2)
+
+            Pmatrix = np.array([[1, rhohat/(2*ahat), rhohat/(2*ahat)],
+                                [uhat, rhohat*(uhat+ahat)/(2*ahat), rhohat*(uhat-ahat)/(2*ahat)],
+                                [uhat*uhat/2, rhohat*(Hhat+uhat*ahat)/(2*ahat), rhohat*(Hhat-uhat*ahat)/(2*ahat)]])
+
+            eigenvalues = np.array([uhat, uhat + ahat, uhat - ahat])
+            Pmatrix_inverse = np.linalg.inv(Pmatrix)
+            return Pmatrix_inverse, Pmatrix, eigenvalues
+
+        def eno3_left_iphalf(w_im2, w_im1, w_i, w_ip1, w_ip2):
+            p0 = (1.0 / 3.0) * w_im2 - (7.0 / 6.0) * w_im1 + (11.0 / 6.0) * w_i
+            p1 = -(1.0 / 6.0) * w_im1 + (5.0 / 6.0) * w_i + (1.0 / 3.0) * w_ip1
+            p2 = (1.0 / 3.0) * w_i + (5.0 / 6.0) * w_ip1 - (1.0 / 6.0) * w_ip2
+
+            b0 = abs(w_im2 - 2.0 * w_im1 + w_i)
+            b1 = abs(w_im1 - 2.0 * w_i + w_ip1)
+            b2 = abs(w_i - 2.0 * w_ip1 + w_ip2)
+            s = int(np.argmin([b0, b1, b2]))
+            return [p0, p1, p2][s]
+
+        def eno3_right_iphalf(w_im1, w_i, w_ip1, w_ip2, w_ip3):
+            p0 = -(1.0 / 6.0) * w_im1 + (5.0 / 6.0) * w_i + (1.0 / 3.0) * w_ip1
+            p1 = (1.0 / 3.0) * w_i + (5.0 / 6.0) * w_ip1 - (1.0 / 6.0) * w_ip2
+            p2 = (11.0 / 6.0) * w_ip1 - (7.0 / 6.0) * w_ip2 + (1.0 / 3.0) * w_ip3
+
+            b0 = abs(w_im1 - 2.0 * w_i + w_ip1)
+            b1 = abs(w_i - 2.0 * w_ip1 + w_ip2)
+            b2 = abs(w_ip1 - 2.0 * w_ip2 + w_ip3)
+            s = int(np.argmin([b0, b1, b2]))
+            return [p0, p1, p2][s]
+
+        nc = nx - 6
+        UL = np.zeros((nvar, nc+1), dtype=Ulast.dtype)
+        UR = np.zeros((nvar, nc+1), dtype=Ulast.dtype)
+        eigenvals = np.zeros((nvar, nc+1), dtype=Ulast.dtype)
+
+        for j, ic in enumerate(range(3, nx - 2)):
+            u_im3 = Ulast[:, ic - 3]
+            u_im2 = Ulast[:, ic - 2]
+            u_im1 = Ulast[:, ic - 1]
+            u_i = Ulast[:, ic]
+            u_ip1 = Ulast[:, ic + 1]
+            u_ip2 = Ulast[:, ic + 2]
+
+            L, R, eigenvals_j = eig_lr(u_im1, u_i)
+
+            # Project stencil points to characteristic space (minus and plus interfaces)
+            wm_im3 = L @ u_im3
+            wm_im2 = L @ u_im2
+            wm_im1 = L @ u_im1
+            wm_i = L @ u_i
+            wm_ip1 = L @ u_ip1
+            wm_ip2 = L @ u_ip2
+
+
+            w_uL = np.zeros(nvar, dtype=Ulast.dtype)
+            w_uR = np.zeros(nvar, dtype=Ulast.dtype)
+
+            for pidx in range(nvar):
+                # UmL: U^- at x_{i-1/2} = left ENO3 at (i-1)+1/2
+                w_uL[pidx] = eno3_left_iphalf(
+                    wm_im3[pidx], wm_im2[pidx], wm_im1[pidx], wm_i[pidx], wm_ip1[pidx]
+                )
+                # UmR: U^+ at x_{i-1/2}
+                w_uR[pidx] = eno3_right_iphalf(
+                    wm_im2[pidx], wm_im1[pidx], wm_i[pidx], wm_ip1[pidx], wm_ip2[pidx]
+                )
+
+
+            UL[:, j] = R @ w_uL
+            UR[:, j] = R @ w_uR 
+            eigenvals[:, j] = eigenvals_j
+
+        return UL, UR, eigenvals
+
+
+#### OLD FLUXES (RUSANOV AND HLL)####
+    def Rusanov_flux(U, A, n):
+
+        UL, UR, eigenvals = weno5_reconstruct(U, n)
+
+        # print("UL:", UL)
+        # print("UR:", UR)
+
+        # for i in range(UL.shape[1]-1):
+        #     if np.all(UL[:, i+1] == UR[:, i]):
+        #         print(f"Warning: UL and UR are identical at index {i}, which may cause zero wave speed and excessive dissipation in Rusanov flux.")
+
+        if wave_speed_method == 'simple':
+            alpha = max_wave_speed(U, A, n, case='flux')  # Simple max wave speeds at x_{i-1/2} and x_{i+1/2}
+
+        elif wave_speed_method == 'Toro':
+            alpha = max_wave_speed_Toro(U, A, n, case='flux')  # Toro's max wave speeds at x_{i-1/2} and x_{i+1/2}
+            
+        AL = Amatrices(UL, A, n)
+        AR = Amatrices(UR, A, n)
+
+        f = np.zeros_like(UL)
+
+        for i in range(UL.shape[1]):
+            f[:, i] = 0.5 * (AL[:, :, i] @ UL[:, i] + AR[:, :, i] @ UR[:, i]) - 0.5 * beta * alpha[i] * (UR[:, i] - UL[:, i])
+
+        fm = f[:, :-1]  # flux at i-1/2
+        fp = f[:, 1:]   # flux at i+1/2
+
+        return fm, fp # flux at i-1/2 and i+1/2
+    
+    def HLL_flux(U, A, n):
+        UL, UR, eigenvals = weno5_reconstruct(U, n)
+
+        if wave_speed_method == 'simple':
+            alpha = max_wave_speed(U, A, n, case='flux')  # Simple max wave speeds at x_{i-1/2} and x_{i+1/2}
+
+        elif wave_speed_method == 'Toro':
+            alpha = max_wave_speed_Toro(U, A, n, case='flux')  # Toro's max wave speeds at x_{i-1/2} and x_{i+1/2}
+            
+        AL = Amatrices(UL, A, n)
+        AR = Amatrices(UR, A, n)
+
+        fL = np.zeros_like(UL)
+        fR = np.zeros_like(UR)
+
+        for i in range(UL.shape[1]):
+            fL[:, i] = AL[:, :, i] @ UL[:, i]
+            fR[:, i] = AR[:, :, i] @ UR[:, i]
+
+        SL = np.minimum(np.min(eigenvals, axis=0), 0)  # Davidson's HLL wave speed estimates
+        SR = np.maximum(np.max(eigenvals, axis=0), 0)  # Davidson's HLL wave speed estimates
+
+        fm = np.zeros_like(UL)
+        fp = np.zeros_like(UR)
+        f = np.zeros_like(UL)
+
+        for i in range(UL.shape[1]):
+            if SL[i] >= 0:
+                f[:, i] = fL[:, i]
+            elif SR[i] <= 0:
+                f[:, i] = fR[:, i]
+            else:
+                f[:, i] = (SR[i]*fL[:, i] - SL[i]*fR[:, i] + SL[i]*SR[i]*(UR[:, i] - UL[:, i])) / (SR[i] - SL[i])
+
+        fm = f[:, :-1]  # flux at i-1/2
+        fp = f[:, 1:]   # flux at i+1/2
+
+        # print(fm.shape)
+        return fm, fp # flux at i-1/2 and i+1/2
