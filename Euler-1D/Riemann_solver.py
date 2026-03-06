@@ -57,44 +57,78 @@ def simulate():
     def initial_Riemann(U, A, n):
         shape = U.shape
 
-        rhoL = 1.0
-        pL = 1.0e5
-        uL = 0.0
+        rhoL = 1
+        pL = 1e5
+        uL = 0
         left_state = np.array([rhoL, rhoL*uL, (pL/(k-1) + 0.5*rhoL*uL*uL)])  # (rho*A, rho*u*A, rho*E*A) left state
 
         rhoR = 0.125
-        pR = 1.0e4
-        uR = 0.0
+        pR = 1e4
+        uR = 0
         right_state = np.array([rhoR, rhoR*uR, (pR/(k-1) + 0.5*rhoR*uR*uR)])  # (rho*A, rho*u*A, rho*E*A) right state
         
         UL = np.repeat(left_state, shape[1]//2, axis=0).reshape(3, shape[1]//2)
         UR = np.repeat(right_state, shape[1]//2, axis=0).reshape(3, shape[1]//2)
 
-        # even number of points necessary!
-        U[:, :shape[1]//2, n] = UL
-        U[:, shape[1]//2:, n] = UR
+        if shape[1] % 2 != 0:
+            U[:, :shape[1]//2, n] = UL
+            U[:, shape[1]//2, n] = (UL[:, -1] + UR[:, 0]) / 2  # set middle point to average of left and right states for better WENO reconstruction
+            U[:, shape[1]//2+1:, n] = UR
+        else: 
+            U[:, :shape[1]//2, n] = UL
+            U[:, shape[1]//2:, n] = UR
         return U
 
 
     def Riemann_BC(U, n):
-        Ulast = U[:, :, n]
-        # Simple reflective BCs for now (2 ghost cells on each side)
-        Ulast[:, 0] = Ulast[:, 3]  # left ghost cell 1
-        Ulast[:, 1] = Ulast[:, 3]  # left ghost cell 2 (can be same as first for simplicity)
-        Ulast[:, 2] = Ulast[:, 3]  # left ghost cell 3 (can be same as first for simplicity)
-        Ulast[:, -1] = Ulast[:, -4]  # right ghost cell 1
-        Ulast[:, -2] = Ulast[:, -4]  # right ghost cell 2 (can be same as first for simplicity)
-        Ulast[:, -3] = Ulast[:, -4]  # right ghost cell 3 (can be same as first for simplicity)
+        # Left boundary: rigid reflective wall.
+        left_dst = np.array([2, 1, 0])
+        left_src = np.array([3, 4, 5])
+        U[:, left_dst, n] = U[:, left_src, n]
+        U[1, left_dst, n] = -U[1, left_src, n]
 
-        # speed is reflected, not symmetric
-        # u   = Ulast[1] / Ulast[0]
-        Ulast[1, 0] = -Ulast[1, 3]  # left ghost cell 1
-        Ulast[1, 1] = -Ulast[1, 3]  # left ghost cell 2 (can be same as first for simplicity)
-        Ulast[1, 2] = -Ulast[1, 3]  # left ghost cell 3 (can be same as first for simplicity)
-        Ulast[1, -1] = -Ulast[1, -4]  # right ghost cell 1
-        Ulast[1, -2] = -Ulast[1, -4]  # right ghost cell 2 (can be same as first for simplicity)
-        Ulast[1, -3] = -Ulast[1, -4]  # right ghost cell 3 (can be same as first for simplicity)
-        U[:, :, n] = Ulast  # update U with new BCs for current time step
+        if boundary_case == 'wall-wall':
+            # Right boundary: rigid reflective wall.
+            right_dst = np.array([-3, -2, -1])
+            right_src = np.array([-4, -5, -6])
+            U[:, right_dst, n] = U[:, right_src, n]
+            U[1, right_dst, n] = -U[1, right_src, n]
+            return U
+
+        if boundary_case != 'wall-atmosphere':
+            raise ValueError("boundary_case must be 'wall-wall' or 'wall-atmosphere'.")
+
+        # Right boundary: atmospheric outlet/inlet.
+        # - Supersonic outflow: all characteristics leave, use zero-gradient.
+        # - Subsonic outflow: impose ambient pressure, extrapolate rho and u.
+        # - Backflow: impose full ambient state.
+        i_in = -4
+        rho_in = max(U[0, i_in, n], 1e-12)
+        u_in = U[1, i_in, n] / rho_in
+        E_in = U[2, i_in, n] / rho_in
+        p_in = max(rho_in * (k - 1.0) * (E_in - 0.5 * u_in * u_in), 1.0)
+        a_in = math.sqrt(k * p_in / rho_in)
+
+        if u_in >= a_in:
+            # Supersonic outflow: copy nearest interior state.
+            U[:, -3:, n] = U[:, i_in:i_in+1, n]
+            return U
+
+        if u_in >= 0.0:
+            # Subsonic outflow: ambient pressure closure.
+            rho_g = rho_in
+            u_g = u_in
+            p_g = p0
+        else:
+            # Backflow from atmosphere.
+            rho_g = rho0
+            u_g = 0.0
+            p_g = p0
+
+        E_g = p_g / (k - 1.0) + 0.5 * rho_g * u_g * u_g
+        U[0, -3:, n] = rho_g
+        U[1, -3:, n] = rho_g * u_g
+        U[2, -3:, n] = E_g
         return U
     
     def weno5_reconstruct(U, n):
@@ -175,26 +209,32 @@ def simulate():
         u_ip1 = Ulast[:, 4:m+4]
         u_ip2 = Ulast[:, 5:m+5]
 
-        rhoL = np.maximum(u_im1[0], eps)
+        # rhoL = np.maximum(u_im1[0], eps)
+        rhoL = u_im1[0]
         velL = u_im1[1] / rhoL
         EL = u_im1[2] / rhoL
-        pL = np.maximum(rhoL * (k - 1.0) * (EL - 0.5 * velL * velL), eps)
+        # pL = np.maximum(rhoL * (k - 1.0) * (EL - 0.5 * velL * velL), eps)
+        pL = rhoL * (k - 1.0) * (EL - 0.5 * velL * velL)
         HL = EL + pL / rhoL
 
-        rhoR = np.maximum(u_i[0], eps)
+        # rhoR = np.maximum(u_i[0], eps)
+        rhoR = u_i[0]
         velR = u_i[1] / rhoR
         ER = u_i[2] / rhoR
-        pR = np.maximum(rhoR * (k - 1.0) * (ER - 0.5 * velR * velR), eps)
+        # pR = np.maximum(rhoR * (k - 1.0) * (ER - 0.5 * velR * velR), eps)
+        pR = rhoR * (k - 1.0) * (ER - 0.5 * velR * velR)
         HR = ER + pR / rhoR
 
         sL = np.sqrt(rhoL)
         sR = np.sqrt(rhoR)
-        denom = np.maximum(sL + sR, eps)
+        # denom = np.maximum(sL + sR, eps)
+        denom = sL + sR
 
         rhohat = sL * sR
         uhat = (sL * velL + sR * velR) / denom
         Hhat = (sL * HL + sR * HR) / denom
-        ahat2 = np.maximum((k - 1.0) * (Hhat - 0.5 * uhat * uhat), eps)
+        # ahat2 = np.maximum((k - 1.0) * (Hhat - 0.5 * uhat * uhat), eps)
+        ahat2 = (k - 1.0) * (Hhat - 0.5 * uhat * uhat)
         ahat = np.sqrt(ahat2)
 
         P = np.empty((m, 3, 3), dtype=Ulast.dtype)
@@ -255,8 +295,8 @@ def simulate():
     def max_wave_speed_Toro(U, A, n, case):
         UL, UR, _ = weno5_reconstruct(U, n)
 
-        _, uL, pL, _, aL = primitives(UL, A, n)  # primitives at x_{i-1/2} left state
-        _, uR, pR, _, aR = primitives(UR, A, n)  # primitives at x_{i-1/2} right state
+        rhoL, uL, pL, _, aL = primitives(UL, A, n)  # primitives at x_{i-1/2} left state
+        rhoR, uR, pR, _, aR = primitives(UR, A, n)  # primitives at x_{i-1/2} right state
 
         gamma_exp = (k - 1) / (2 * k)
         power_exp = 2 * k / (k - 1)
@@ -264,6 +304,11 @@ def simulate():
         base_den = aL / (pL ** gamma_exp) + aR / (pR ** gamma_exp)
         base = base_num / base_den
         pstarr = np.power(base, power_exp)  # Toro's p* estimate at x_{i-1/2}
+        #### ALTERNATE METHOD FOR p* ####
+        # rhohat = 0.5 * (rhoL + rhoR)
+        # ahat = 0.5 * (aL + aR)
+        # ppvrs = 0.5 * (pL + pR) - 0.5 * (uR - uL) * rhohat * ahat
+        # pstarr = np.maximum(0.0, ppvrs)  # Toro's p* estimate at x_{i-1/2}, with positivity preservation
 
         qL = np.where(pstarr <= pL, 1.0, np.sqrt(1.0 + (k + 1.0) / (2.0 * k) * (pstarr / pL - 1.0)))
         qR = np.where(pstarr <= pR, 1.0, np.sqrt(1.0 + (k + 1.0) / (2.0 * k) * (pstarr / pR - 1.0)))
@@ -297,7 +342,7 @@ def simulate():
         Sstar = (pR - pL + rhoL*uL*(SL-uL) - rhoR*uR*(SR-uR))/(rhoL*(SL-uL) - rhoR*(SR-uR))
 
         UstarL = rhoL * (SL - uL) / (SL - Sstar) * np.array([np.ones(SL.shape), Sstar, EL + (Sstar - uL)*(Sstar + pL/(rhoL*(SL-uL)))])
-        UstarR = rhoR * (SR - uR) / (SR - Sstar) * np.array([np.ones(SL.shape), Sstar, ER + (Sstar - uR)*(Sstar + pR/(rhoR*(SR-uR)))])
+        UstarR = rhoR * (SR - uR) / (SR - Sstar) * np.array([np.ones(SR.shape), Sstar, ER + (Sstar - uR)*(Sstar + pR/(rhoR*(SR-uR)))])
         fstarL = fL + SL * (UstarL - UL)
         fstarR = fR + SR * (UstarR - UR)
 
@@ -319,11 +364,12 @@ def simulate():
 
         return fm, fp
 
+
     def find_dt(U, A, dx, cfl):
         if wave_speed_method == 'Dava':
-            llam = max_wave_speed_Dava(U, A, n, case='dt')  # Simple
+            llam = max_wave_speed_Dava(U, A, n, case='dt')
         elif wave_speed_method == 'Toro':
-            llam = max_wave_speed_Toro(U, A, n, case='dt') # Toro
+            llam = max_wave_speed_Toro(U, A, n, case='dt')
         return cfl * dx / llam if llam > 0 else 1e-6
     
     def SSPRK45(U, A, dt, dx, n, nx):
@@ -430,10 +476,19 @@ def simulate():
     dx = 1 / (nx - 6)
     cfl = 0.9
     wave_speed_method = 'Toro'  # 'Dava' or 'Toro'
-    print_progress = False
+    boundary_case = 'wall-wall'  # 'wall-wall' or 'wall-atmosphere'
+    print_progress = True
+
+    # Atmospheric conditions used when boundary_case = 'wall-atmosphere'.
+    p0 = 100000  # Pa
+    rho0 = 1.000   # kg/m^3
+    T0 = 348    # K
+    p0_check = rho0 * Rgas * T0
+    if abs(p0_check - p0) / p0 > 5e-2:
+        print(f"Warning: p0, rho0, T0 are not fully consistent with ideal gas: rho0*R*T={p0_check:.2f} Pa")
 
     # Variables to track over time
-    U = np.zeros((3, nx, 2000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step
+    U = np.zeros((3, nx, 200000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step
     A = np.ones([1])  # test cross-sectional area
 
     # Outputs
@@ -441,7 +496,6 @@ def simulate():
     
     n = 0
     U = initial_Riemann(U, A, n)
-
 
     while t < t_end:
         dt = find_dt(U, A, dx, cfl)
@@ -459,6 +513,7 @@ def simulate():
     t_list = np.asarray(t_list, dtype=np.float64)
     U = U[:, :, :n+1]
     plot(U, A, n)
+    # plt.show()
 
 
 if __name__ == "__main__":
