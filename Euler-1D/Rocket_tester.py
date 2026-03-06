@@ -53,7 +53,7 @@ def simulate():
         shape = U.shape
 
         rhoL = 1
-        pL = 1e5
+        pL = 1e6
         uL = 0
         left_state = np.array([rhoL, rhoL*uL, (pL/(k-1) + 0.5*rhoL*uL*uL)])  # (rho*A, rho*u*A, rho*E*A) left state
 
@@ -435,7 +435,7 @@ def simulate():
     # State
     t = 0.0
     t_end = 6e-5
-    nx = 600
+    nx = 2000
     dx = 1 / (nx - 6)
     cfl = 0.9
     wave_speed_method = 'Toro'  # 'Dava' or 'Toro'
