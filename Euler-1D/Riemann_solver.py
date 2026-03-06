@@ -20,7 +20,6 @@ os.environ.setdefault("MKL_NUM_THREADS", "16")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "16")
 
 import numpy as np
-from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
 
 ar = 'auto'
@@ -35,69 +34,171 @@ line_color = 'orangered'
 
 
 def simulate():
+
+    def positivity_theta_pressure(rho0, m0, E0, drho, dm, dE, theta_hi, p_floor):
+        """Find largest theta in [0, theta_hi] such that pressure(theta) >= p_floor."""
+        if theta_hi <= 0.0:
+            return 0.0
+
+        def p_of(theta):
+            rho = rho0 + theta * drho
+            m = m0 + theta * dm
+            E = E0 + theta * dE
+            rho = max(rho, 1e-14)
+            return (k - 1.0) * (E - 0.5 * m * m / rho)
+
+        if p_of(theta_hi) >= p_floor:
+            return theta_hi
+
+        lo = 0.0
+        hi = theta_hi
+        for _ in range(32):
+            mid = 0.5 * (lo + hi)
+            if p_of(mid) >= p_floor:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    def positivity_limit_state(U_ref, U_cand):
+        """Cell-wise positivity limiter using convex limiting U = U_ref + theta*(U_cand-U_ref)."""
+        U_out = U_cand.copy()
+        tiny = 1e-14
+
+        for i in range(U_ref.shape[1]):
+            rho0 = U_ref[0, i]
+            m0 = U_ref[1, i]
+            E0 = U_ref[2, i]
+
+            drho = U_cand[0, i] - rho0
+            dm = U_cand[1, i] - m0
+            dE = U_cand[2, i] - E0
+
+            rho_cand = U_cand[0, i]
+            theta_rho = 1.0
+            if rho_cand < rho_floor:
+                denom = rho0 - rho_cand
+                if denom <= tiny:
+                    theta_rho = 0.0
+                else:
+                    theta_rho = max(0.0, min(1.0, (rho0 - rho_floor) / denom))
+
+            theta = positivity_theta_pressure(rho0, m0, E0, drho, dm, dE, theta_rho, p_floor)
+
+            U_out[0, i] = rho0 + theta * drho
+            U_out[1, i] = m0 + theta * dm
+            U_out[2, i] = E0 + theta * dE
+
+        return U_out
     
-    def primitives(U, A, n):
+    def primitives(U, A):
         """Convert conserved variables U to primitive variables (rho, u, p, E, a).
         U = [rho*A, rho*u*A, rho*E*A], where E is total energy per volume. A is cross-sectional area.
         """
         A_place = 1
-        if U.ndim == 3:
-            rho = U[0, :, n]
-            u   = U[1, :, n] / rho
-            E   = U[2, :, n] / rho     # total specific energy (per unit mass)
-        else:
-            rho = U[0, :]
-            u   = U[1, :] / rho
-            E   = U[2, :] / rho    # total specific energy (per unit mass)
-        
-        p = rho * (k - 1.0) * (E - 0.5 * u*u)
-        a = np.sqrt(k * p / rho)
+        rho = np.maximum(U[0, :], rho_floor)
+        u = U[1, :] / rho
+
+        # Use total specific energy from conserved variables, then enforce
+        # physically admissible internal energy and pressure.
+        Etot = U[2, :] / rho
+        e_int = Etot - 0.5 * u * u
+        e_int_floor = p_floor / ((k - 1.0) * rho)
+        e_int = np.maximum(e_int, e_int_floor)
+
+        p = (k - 1.0) * rho * e_int
+
+        # Optional acoustic cap to prevent tiny-rho outliers from forcing dt -> 0.
+        if a_max is not None:
+            p_cap = rho * (a_max * a_max) / k
+            p = np.minimum(p, p_cap)
+
+        E = p / ((k - 1.0) * rho) + 0.5 * u * u
+        a = np.sqrt(np.maximum(k * p / rho, 0.0))
+
+        if a_max is not None and np.any(a > 0.95 * a_max):
+            idx = np.where(a > 0.95 * a_max)
+            print("Warning: acoustic cap is active at indices:", idx[0][:10])
+        # if np.any(a < 2):
+        #     print(a[np.where(a < 2)])
+        #     print("Warning: very low sound speed detected, may cause dt to be very small.")
+        #     print("pressure:", p[np.where(a < 2)], "rho:", rho[np.where(a < 2)], "u:", u[np.where(a < 2)], "E:", E[np.where(a < 2)])
         return rho, u, p, E, a
     
-    def initial_Riemann(U, A, n):
+    def initial_Riemann(U, A):
         shape = U.shape
 
         rhoL = 1.0
-        pL = 1.0e5
-        uL = 0.0
+        pL = 0.4
+        uL = -2
         left_state = np.array([rhoL, rhoL*uL, (pL/(k-1) + 0.5*rhoL*uL*uL)])  # (rho*A, rho*u*A, rho*E*A) left state
 
-        rhoR = 0.125
-        pR = 1.0e4
-        uR = 0.0
+        rhoR = 1
+        pR = 0.4
+        uR = 2
         right_state = np.array([rhoR, rhoR*uR, (pR/(k-1) + 0.5*rhoR*uR*uR)])  # (rho*A, rho*u*A, rho*E*A) right state
         
         UL = np.repeat(left_state, shape[1]//2, axis=0).reshape(3, shape[1]//2)
         UR = np.repeat(right_state, shape[1]//2, axis=0).reshape(3, shape[1]//2)
 
         # even number of points necessary!
-        U[:, :shape[1]//2, n] = UL
-        U[:, shape[1]//2:, n] = UR
+        U[:, :shape[1]//2, 0] = UL
+        U[:, shape[1]//2:, 0] = UR
         return U
 
 
-    def Riemann_BC(U, n):
-        Ulast = U[:, :, n]
-        # Simple reflective BCs for now (2 ghost cells on each side)
-        Ulast[:, 0] = Ulast[:, 3]  # left ghost cell 1
-        Ulast[:, 1] = Ulast[:, 3]  # left ghost cell 2 (can be same as first for simplicity)
-        Ulast[:, 2] = Ulast[:, 3]  # left ghost cell 3 (can be same as first for simplicity)
-        Ulast[:, -1] = Ulast[:, -4]  # right ghost cell 1
-        Ulast[:, -2] = Ulast[:, -4]  # right ghost cell 2 (can be same as first for simplicity)
-        Ulast[:, -3] = Ulast[:, -4]  # right ghost cell 3 (can be same as first for simplicity)
+    def Riemann_BC(U):
+        # Left boundary: rigid reflective wall.
+        left_dst = np.array([2, 1, 0])
+        left_src = np.array([3, 4, 5])
+        U[:, left_dst] = U[:, left_src]
+        U[1, left_dst] = -U[1, left_src]
 
-        # speed is reflected, not symmetric
-        # u   = Ulast[1] / Ulast[0]
-        Ulast[1, 0] = -Ulast[1, 3]  # left ghost cell 1
-        Ulast[1, 1] = -Ulast[1, 3]  # left ghost cell 2 (can be same as first for simplicity)
-        Ulast[1, 2] = -Ulast[1, 3]  # left ghost cell 3 (can be same as first for simplicity)
-        Ulast[1, -1] = -Ulast[1, -4]  # right ghost cell 1
-        Ulast[1, -2] = -Ulast[1, -4]  # right ghost cell 2 (can be same as first for simplicity)
-        Ulast[1, -3] = -Ulast[1, -4]  # right ghost cell 3 (can be same as first for simplicity)
-        U[:, :, n] = Ulast  # update U with new BCs for current time step
+        if boundary_case == 'wall-wall':
+            # Right boundary: rigid reflective wall.
+            right_dst = np.array([-3, -2, -1])
+            right_src = np.array([-4, -5, -6])
+            U[:, right_dst] = U[:, right_src]
+            U[1, right_dst] = -U[1, right_src]
+            return U
+
+        if boundary_case != 'wall-atmosphere':
+            raise ValueError("boundary_case must be 'wall-wall' or 'wall-atmosphere'.")
+
+        # Right boundary: atmospheric outlet/inlet.
+        # - Supersonic outflow: all characteristics leave, use zero-gradient.
+        # - Subsonic outflow: impose ambient pressure, extrapolate rho and u.
+        # - Backflow: impose full ambient state.
+        i_in = -4
+        rho_in = max(U[0, i_in], 1e-12)
+        u_in = U[1, i_in] / rho_in
+        E_in = U[2, i_in] / rho_in
+        p_in = max(rho_in * (k - 1.0) * (E_in - 0.5 * u_in * u_in), 1.0)
+        a_in = math.sqrt(k * p_in / rho_in)
+
+        if u_in >= a_in:
+            # Supersonic outflow: copy nearest interior state.
+            U[:, -3:] = U[:, i_in:i_in+1]
+            return U
+
+        if u_in >= 0.0:
+            # Subsonic outflow: ambient pressure closure.
+            rho_g = rho_in
+            u_g = u_in
+            p_g = p0
+        else:
+            # Backflow from atmosphere.
+            rho_g = rho0
+            u_g = 0.0
+            p_g = p0
+
+        E_g = p_g / (k - 1.0) + 0.5 * rho_g * u_g * u_g
+        U[0, -3:] = rho_g
+        U[1, -3:] = rho_g * u_g
+        U[2, -3:] = E_g
         return U
     
-    def weno5_reconstruct(U, n):
+    def weno5_reconstruct(U):
         """
         Characteristic WENO5 reconstruction for 1D Euler variables.
 
@@ -108,8 +209,7 @@ def simulate():
         - UpL: U^- at x_{i+1/2}
         - UpR: U^+ at x_{i+1/2}
         """
-        nvar, nx, nt = U.shape
-        Ulast = U[:, :, n]  # current time step
+        nvar, nx = U.shape
         if nx < 7:
             raise ValueError("Need at least 7 points (including ghost cells) for WENO5.")
         if nvar != 3:
@@ -168,12 +268,12 @@ def simulate():
         m = nx - 5  # number of reconstructed interfaces
 
         # Build all stencils at once to avoid Python-loop overhead.
-        u_im3 = Ulast[:, 0:m]
-        u_im2 = Ulast[:, 1:m+1]
-        u_im1 = Ulast[:, 2:m+2]
-        u_i = Ulast[:, 3:m+3]
-        u_ip1 = Ulast[:, 4:m+4]
-        u_ip2 = Ulast[:, 5:m+5]
+        u_im3 = U[:, 0:m]
+        u_im2 = U[:, 1:m+1]
+        u_im1 = U[:, 2:m+2]
+        u_i = U[:, 3:m+3]
+        u_ip1 = U[:, 4:m+4]
+        u_ip2 = U[:, 5:m+5]
 
         rhoL = np.maximum(u_im1[0], eps)
         velL = u_im1[1] / rhoL
@@ -197,7 +297,7 @@ def simulate():
         ahat2 = np.maximum((k - 1.0) * (Hhat - 0.5 * uhat * uhat), eps)
         ahat = np.sqrt(ahat2)
 
-        P = np.empty((m, 3, 3), dtype=Ulast.dtype)
+        P = np.empty((m, 3, 3), dtype=U.dtype)
         P[:, 0, 0] = 1.0
         P[:, 0, 1] = rhohat / (2.0 * ahat)
         P[:, 0, 2] = rhohat / (2.0 * ahat)
@@ -225,44 +325,21 @@ def simulate():
         UR = np.einsum('mab,bm->am', P, w_uR)
 
         return UL, UR, eigenvals
-    
-    # Wave speed
-    # Option 1 (very simple): max local characteristic speed from primitives
-    def max_wave_speed_Dava(U, A, n, case):
-        UL, UR, _ = weno5_reconstruct(U, n)
-        _, uL, _, _, aL = primitives(UL, A, n)
-        _, uR, _, _, aR = primitives(UR, A, n)
-        SL = uL - aL
-        SR = uR + aR
 
-        if case == 'dt':
-            return np.max(np.abs([SL, SR]))
-        elif case == 'flux':
-            return SL, SR
-    
-    def max_wave_speed_Davb(U, A, n, case):
-        UL, UR, _ = weno5_reconstruct(U, n)
-        _, uL, _, _, aL = primitives(UL, A, n)
-        _, uR, _, _, aR = primitives(UR, A, n)
-        SL = np.min([uL - aL, uR - aR], axis=0)
-        SR = np.max([uL + aL, uR + aR], axis=0)
+    def max_wave_speed_Toro(U, A, case):
+        UL, UR, _ = weno5_reconstruct(U)
 
-        if case == 'dt':
-            return np.max(np.abs([SL, SR]))
-        elif case == 'flux':
-            return SL, SR
+        rhoL, uL, pL, _, aL = primitives(UL, A)  # primitives at x_{i-1/2} left state
+        rhoR, uR, pR, _, aR = primitives(UR, A)  # primitives at x_{i-1/2} right state
 
-    def max_wave_speed_Toro(U, A, n, case):
-        UL, UR, _ = weno5_reconstruct(U, n)
-
-        _, uL, pL, _, aL = primitives(UL, A, n)  # primitives at x_{i-1/2} left state
-        _, uR, pR, _, aR = primitives(UR, A, n)  # primitives at x_{i-1/2} right state
+        pL = np.maximum(pL, p_floor)
+        pR = np.maximum(pR, p_floor)
 
         gamma_exp = (k - 1) / (2 * k)
         power_exp = 2 * k / (k - 1)
         base_num = aL + aR - 0.5 * (k - 1) * (uR - uL)
         base_den = aL / (pL ** gamma_exp) + aR / (pR ** gamma_exp)
-        base = base_num / base_den
+        base = np.maximum(base_num / np.maximum(base_den, 1e-14), 1e-14)
         pstarr = np.power(base, power_exp)  # Toro's p* estimate at x_{i-1/2}
 
         qL = np.where(pstarr <= pL, 1.0, np.sqrt(1.0 + (k + 1.0) / (2.0 * k) * (pstarr / pL - 1.0)))
@@ -270,34 +347,60 @@ def simulate():
 
         SL = uL - aL*qL
         SR = uR + aR*qR
-        
+
+        # SLmax = np.max(np.abs(SL))
+        # index = np.where(np.abs(SL) == SLmax)[0]
+        # print(f"SL max: {SLmax:.4f} at index {index[0]} with uL={uL[index[0]]:.4f}, aL={aL[index[0]]:.4f}, rhoL={qL[index[0]]:.4f}, pL={pL[index[0]]:.4f}")
+        # SRmax = np.max(np.abs(SR))
+        # index = np.where(np.abs(SR) == SRmax)[0]
+        # print(f"SR max: {SRmax:.4f} at index {index[0]} with uR={uR[index[0]]:.4f}, aR={aR[index[0]]:.4f}, rhoR={qR[index[0]]:.4f}, pR={pR[index[0]]:.4f}")
+
         if case == 'dt':
             return np.max(np.abs([SL, SR]))
         elif case == 'flux':
             return SL, SR
 
-    def Euler_flux(U, A, n):
-        rho, u, p, E, a = primitives(U, A, n)
+    def Euler_flux(U, A):
+        rho, u, p, E, _ = primitives(U, A)
         return np.vstack((rho*u, rho*u**2 + p, u*(rho*E + p)))
 
-    def HLLC_flux(U, A, n):
-        UL, UR, eigenvals = weno5_reconstruct(U, n)
-        rhoL, uL, pL, EL, aL = primitives(UL, A, n)  # primitives at left state
-        rhoR, uR, pR, ER, aR = primitives(UR, A, n)  # primitives at right state
+    def HLLC_flux(U, A):
+        UL, UR, eigenvals = weno5_reconstruct(U)
+        rhoL, uL, pL_raw, EL, aL = primitives(UL, A)  # primitives at left state
+        rhoR, uR, pR_raw, ER, aR = primitives(UR, A)  # primitives at right state
 
-        fL = Euler_flux(UL, A, n)
-        fR = Euler_flux(UR, A, n)
+        rhoL = np.maximum(rhoL, rho_floor)
+        rhoR = np.maximum(rhoR, rho_floor)
+        pL = np.maximum(pL_raw, p_floor)
+        pR = np.maximum(pR_raw, p_floor)
+        aL = np.sqrt(k * pL / rhoL)
+        aR = np.sqrt(k * pR / rhoR)
+
+        fL = Euler_flux(UL, A)
+        fR = Euler_flux(UR, A)
 
         if wave_speed_method == 'Dava':
             SL = np.minimum(np.min(eigenvals, axis=0), 0)  # Davidson's HLL wave speed estimates
             SR = np.maximum(np.max(eigenvals, axis=0), 0)  # Davidson's HLL wave speed estimates
         elif wave_speed_method == 'Toro':
-            SL, SR = max_wave_speed_Toro(U, A, n, case='flux')  # Toro's max wave speeds at x_{i-1/2} and x_{i+1/2}
+            SL, SR = max_wave_speed_Toro(U, A, case='flux')  # Toro's max wave speeds at x_{i-1/2} and x_{i+1/2}
 
-        Sstar = (pR - pL + rhoL*uL*(SL-uL) - rhoR*uR*(SR-uR))/(rhoL*(SL-uL) - rhoR*(SR-uR))
+        SL = np.minimum(SL, 0.0)
+        SR = np.maximum(SR, 0.0)
 
-        UstarL = rhoL * (SL - uL) / (SL - Sstar) * np.array([np.ones(SL.shape), Sstar, EL + (Sstar - uL)*(Sstar + pL/(rhoL*(SL-uL)))])
-        UstarR = rhoR * (SR - uR) / (SR - Sstar) * np.array([np.ones(SL.shape), Sstar, ER + (Sstar - uR)*(Sstar + pR/(rhoR*(SR-uR)))])
+        # Positivity-preserving backup flux (HLLE), used when HLLC star state is ill-conditioned.
+        denom_hlle = np.maximum(SR - SL, 1e-14)
+        f_hlle = (SR * fL - SL * fR + SL * SR * (UR - UL)) / denom_hlle
+
+        tiny = 1e-14
+        denom_star = rhoL * (SL - uL) - rhoR * (SR - uR)
+        Sstar = (pR - pL + rhoL * uL * (SL - uL) - rhoR * uR * (SR - uR)) / np.where(np.abs(denom_star) > tiny, denom_star, tiny)
+
+        denom_l = np.where(np.abs(SL - Sstar) > tiny, SL - Sstar, tiny)
+        denom_r = np.where(np.abs(SR - Sstar) > tiny, SR - Sstar, tiny)
+
+        UstarL = rhoL * (SL - uL) / denom_l * np.array([np.ones(SL.shape), Sstar, EL + (Sstar - uL)*(Sstar + pL/(rhoL*(SL-uL) + tiny))])
+        UstarR = rhoR * (SR - uR) / denom_r * np.array([np.ones(SL.shape), Sstar, ER + (Sstar - uR)*(Sstar + pR/(rhoR*(SR-uR) + tiny))])
         fstarL = fL + SL * (UstarL - UL)
         fstarR = fR + SR * (UstarR - UR)
 
@@ -314,70 +417,108 @@ def simulate():
         f[:, mask_starR] = fstarR[:, mask_starR]
         f[:, mask_R] = fR[:, mask_R]
 
+        # Detect nonphysical/ill-conditioned interfaces and replace by HLLE locally.
+        rho_star_L = rhoL * (SL - uL) / denom_l
+        rho_star_R = rhoR * (SR - uR) / denom_r
+        p_star_L = pL + rhoL * (SL - uL) * (Sstar - uL)
+        p_star_R = pR + rhoR * (SR - uR) * (Sstar - uR)
+
+        # Extra robustness in compressive, large-jump zones where HLLC can create spurious spikes.
+        pratio = np.maximum(pL, pR) / np.maximum(np.minimum(pL, pR), p_floor)
+        compressive = (uR - uL) < 0.0
+        shock_sensor = compressive & (pratio > shock_pratio_thresh)
+
+        bad_state = (
+            (pL_raw <= p_floor) | (pR_raw <= p_floor)
+            | (rhoL <= rho_floor) | (rhoR <= rho_floor)
+            | (rho_star_L <= rho_floor) | (rho_star_R <= rho_floor)
+            | (p_star_L <= p_floor) | (p_star_R <= p_floor)
+            | (np.abs(denom_star) <= tiny)
+            | (~np.isfinite(Sstar))
+            | (~np.isfinite(f).all(axis=0))
+        )
+        if use_hlle_shock_fix:
+            bad_state = bad_state | shock_sensor
+
+        f[:, bad_state] = f_hlle[:, bad_state]
+
         fm = f[:, :-1]  # flux at i-1/2
         fp = f[:, 1:]   # flux at i+1/2
 
         return fm, fp
 
     def find_dt(U, A, dx, cfl):
-        if wave_speed_method == 'Dava':
-            llam = max_wave_speed_Dava(U, A, n, case='dt')  # Simple
-        elif wave_speed_method == 'Toro':
-            llam = max_wave_speed_Toro(U, A, n, case='dt') # Toro
-        return cfl * dx / llam if llam > 0 else 1e-6
+        # Robust dt: do not rely on a single estimator near strong interactions.
+        llam_toro = max_wave_speed_Toro(U, A, case='dt')
+        _, _, eigenvals = weno5_reconstruct(U)
+        llam_davis = np.max(np.abs(eigenvals))
+        llam = max(llam_toro, llam_davis, 1e-12)
+        return cfl * dx / llam
     
-    def SSPRK45(U, A, dt, dx, n, nx):
+    def SSPRK45(U, A, dt, dx, nx):
 
         # Keep only one stage index to avoid huge allocations each time step.
-        U1 = np.zeros((3, nx, 1), dtype=np.float64)
-        U2 = np.zeros((3, nx, 1), dtype=np.float64)
-        U3 = np.zeros((3, nx, 1), dtype=np.float64)
-        U4 = np.zeros((3, nx, 1), dtype=np.float64)
-
-        U1[:, :, 0] = U[:, :, n]
-        U2[:, :, 0] = U[:, :, n]
-        U3[:, :, 0] = U[:, :, n]
-        U4[:, :, 0] = U[:, :, n]
+        U1 = np.zeros((3, nx), dtype=np.float64)
+        U2 = np.zeros((3, nx), dtype=np.float64)
+        U3 = np.zeros((3, nx), dtype=np.float64)
+        U4 = np.zeros((3, nx), dtype=np.float64)
 
         # shock reflection NOT depicted accurately for now due to sboundary conditions
-        U = Riemann_BC(U, n)
-        fm, fp = HLLC_flux(U, A, n)
+        U = Riemann_BC(U)
+        fm, fp = HLLC_flux(U, A)
         k1 = -1/dx * (fp - fm)
-        U1[:, 3:nx-3, 0] = U[:, 3:nx-3, n] + 0.391752226571890*dt*k1
+        U1_cand = U[:, 3:nx-3] + 0.391752226571890 * dt * k1
+        U1[:, 3:nx-3] = positivity_limit_state(U[:, 3:nx-3], U1_cand)
 
-        U1 = Riemann_BC(U1, 0)
-        fm, fp = HLLC_flux(U1, A, 0)
+        U1 = Riemann_BC(U1)
+        fm, fp = HLLC_flux(U1, A)
         k2 = -1/dx * (fp - fm)
-        U2[:, 3:nx-3, 0] = 0.444370493651235*U[:, 3:nx-3, n] + 0.555629506348765*U1[:, 3:nx-3, 0] + 0.368410593050371*dt*k2
+        U2_base = 0.444370493651235 * U[:, 3:nx-3] + 0.555629506348765 * U1[:, 3:nx-3]
+        U2_cand = U2_base + 0.368410593050371 * dt * k2
+        U2[:, 3:nx-3] = positivity_limit_state(U2_base, U2_cand)
 
-        U2 = Riemann_BC(U2, 0)
-        fm, fp = HLLC_flux(U2, A, 0)
+        U2 = Riemann_BC(U2)
+        fm, fp = HLLC_flux(U2, A)
         k3 = -1/dx * (fp - fm)
-        U3[:, 3:nx-3, 0] = 0.620101851488403*U[:, 3:nx-3, n] + 0.379898148511597*U2[:, 3:nx-3, 0] + 0.251891774271694*dt*k3
+        U3_base = 0.620101851488403 * U[:, 3:nx-3] + 0.379898148511597 * U2[:, 3:nx-3]
+        U3_cand = U3_base + 0.251891774271694 * dt * k3
+        U3[:, 3:nx-3] = positivity_limit_state(U3_base, U3_cand)
 
-        U3 = Riemann_BC(U3, 0)
-        fm, fp = HLLC_flux(U3, A, 0)
+        U3 = Riemann_BC(U3)
+        fm, fp = HLLC_flux(U3, A)
         k4 = -1/dx * (fp - fm)
-        U4[:, 3:nx-3, 0] = 0.178079954393132*U[:, 3:nx-3, n] + 0.821920045606868*U3[:, 3:nx-3, 0] +  0.544974750228521*dt*k4
+        U4_base = 0.178079954393132 * U[:, 3:nx-3] + 0.821920045606868 * U3[:, 3:nx-3]
+        U4_cand = U4_base + 0.544974750228521 * dt * k4
+        U4[:, 3:nx-3] = positivity_limit_state(U4_base, U4_cand)
 
-        U4 = Riemann_BC(U4, 0)
-        fm, fp = HLLC_flux(U4, A, 0)
+        U4 = Riemann_BC(U4)
+        fm, fp = HLLC_flux(U4, A)
         k5 = -1/dx * (fp - fm)
-        Unp1 = 0.517231671970585*U2[:, 3:nx-3, 0] + 0.096059710526147*U3[:, 3:nx-3, 0] + 0.063692468666290*dt*k4 + 0.386708617503268*U4[:, 3:nx-3, 0] + 0.226007483236906*dt*k5
+        U5_base = (
+            0.517231671970585 * U2[:, 3:nx-3]
+            + 0.096059710526147 * U3[:, 3:nx-3]
+            + 0.063692468666290 * dt * k4
+            + 0.386708617503268 * U4[:, 3:nx-3]
+        )
+        U5_cand = U5_base + 0.226007483236906 * dt * k5
+        Unp1 = positivity_limit_state(U5_base, U5_cand)
 
         return Unp1
     
-    def plot(U, A, n):
+    def plot(U, A):
 
-        rho, u, p, E, a = primitives(U, A, n)
+        rho, u, p, E, a = primitives(U, A)
+        i0 = 3
+        i1 = U.shape[1] - 3
+        x = np.arange(i0, i1)
 
-        os.makedirs(f"cfl{cfl}_{wave_speed_method}", exist_ok=True)
+        os.makedirs(f"cfl{cfl}_{wave_speed_method}_timp_{t_end}", exist_ok=True)
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
         # for i in range(0, n+1, max(1, n//10)):
         #     rho_i, u_i, p_i, _, _ = primitives(U, A, i)
         #     ax.plot(rho_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
-        ax.plot(rho, linewidth=4, color=line_color)
+        ax.plot(x, rho[i0:i1], linewidth=4, color=line_color)
         ax.set_ylabel("Densitate rho", fontsize=label_size)
         ax.set_xlabel("x [m]", fontsize=label_size)
         ax.tick_params(axis='both', which='major', labelsize=tick_size)
@@ -385,14 +526,14 @@ def simulate():
         ax.set_xlim(left=0.0)
         ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
-        plt.savefig(f"cfl{cfl}_{wave_speed_method}/rho_end.png")
+        plt.savefig(f"cfl{cfl}_{wave_speed_method}_timp_{t_end}/rho_end.png")
         # plt.clf()
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
         # for i in range(0, n+1, max(1, n//10)):
         #     rho_i, u_i, p_i, _, _ = primitives(U, A, i)
         #     ax.plot(p_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
-        ax.plot(p, linewidth=4, color=line_color)
+        ax.plot(x, p[i0:i1], linewidth=4, color=line_color)
         ax.set_ylabel("Presiune p [Pa]", fontsize=label_size)
         ax.set_xlabel("x [m]", fontsize=label_size)
         ax.tick_params(axis='both', which='major', labelsize=tick_size)
@@ -400,14 +541,14 @@ def simulate():
         ax.set_xlim(left=0.0)
         ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
-        plt.savefig(f"cfl{cfl}_{wave_speed_method}/p_end.png")
+        plt.savefig(f"cfl{cfl}_{wave_speed_method}_timp_{t_end}/p_end.png")
         # plt.clf()
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
         # for i in range(0, n+1, max(1, n//10)):
         #     rho_i, u_i, p_i, _, _ = primitives(U, A, i)
         #     ax.plot(u_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
-        ax.plot(u, linewidth=4, color=line_color)
+        ax.plot(x, u[i0:i1], linewidth=4, color=line_color)
         ax.set_ylabel("Viteza u [m/s]", fontsize=label_size)
         ax.set_xlabel("x [m]", fontsize=label_size)
         ax.tick_params(axis='both', which='major', labelsize=tick_size)
@@ -415,50 +556,68 @@ def simulate():
         ax.set_xlim(left=0.0)
         # ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
-        plt.savefig(f"cfl{cfl}_{wave_speed_method}/u_end.png")
+        plt.savefig(f"cfl{cfl}_{wave_speed_method}_timp_{t_end}/u_end.png")
         # plt.clf()
     
     # Main simulation loop
 
     k = 1.4
     Rgas = 287  # J/kg-K
+    rho_floor = 1e-8
+    p_floor = 1e-8
+    a_max = 5000.0  # m/s; set to None to disable acoustic capping
+    use_hlle_shock_fix = True
+    shock_pratio_thresh = 1.5
 
     # State
     t = 0.0
-    t_end = 6e-4
-    nx = 600
+    t_end = 0.017
+    nx = 100
     dx = 1 / (nx - 6)
     cfl = 0.9
     wave_speed_method = 'Toro'  # 'Dava' or 'Toro'
-    print_progress = False
+    boundary_case = 'wall-wall'  # 'wall-wall' or 'wall-atmosphere'
+
+    # Atmospheric conditions used when boundary_case = 'wall-atmosphere'.
+    p0 = 100000  # Pa
+    rho0 = 1.000   # kg/m^3
+    T0 = 348    # K
+    p0_check = rho0 * Rgas * T0
+    if abs(p0_check - p0) / p0 > 5e-2:
+        print(f"Warning: p0, rho0, T0 are not fully consistent with ideal gas: rho0*R*T={p0_check:.2f} Pa")
+
+    print_progress = True
 
     # Variables to track over time
-    U = np.zeros((3, nx, 2000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step
+    U = np.zeros((3, nx, 100000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step
     A = np.ones([1])  # test cross-sectional area
 
     # Outputs
     t_list = [t]
     
     n = 0
-    U = initial_Riemann(U, A, n)
-
+    U = initial_Riemann(U, A)
+    Utemp = U[:, :, n]
 
     while t < t_end:
-        dt = find_dt(U, A, dx, cfl)
-        U[:, 3:nx-3, n+1] = SSPRK45(U, A, dt, dx, n, nx)
-        U = Riemann_BC(U, n+1)
-        t += dt
-        n += 1
-
-        # Store outputs
-        t_list.append(t)
-        if print_progress:
-            print(t)
+        Utemp = U[:, :, n]
+        dt = find_dt(Utemp, A, dx, cfl)
+        Utemp[:, 3:nx-3] = SSPRK45(Utemp, A, dt, dx, nx)
+        # Utemp = Riemann_BC(Utemp)
+        U[:, :, n+1] = Utemp
+        t = t + dt
         # print(dt)
+        print(t)
+        n += 1
+        
+        # t_list.append(t)
+        # if print_progress and n % 100 == 0:
+        #     print(t)
+            # print(dt)
 
     t_list = np.asarray(t_list, dtype=np.float64)
     U = U[:, :, :n+1]
-    plot(U, A, n)
+    plot(U[:, :, n], A)
 
 
 if __name__ == "__main__":
