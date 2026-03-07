@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+from Riemann_test_cases import test_case
 
 # Hint BLAS/OpenMP backends to use all CPU threads for vectorized kernels.
 os.environ.setdefault("OMP_NUM_THREADS", "16")
@@ -40,47 +41,65 @@ def simulate():
         """Convert conserved variables U to primitive variables (rho, u, p, E, a).
         U = [rho*A, rho*u*A, rho*E*A], where E is total energy per volume. A is cross-sectional area.
         """
-        A_place = 1
-        rho = U[0, :]
-        u   = U[1, :] / rho
-        E   = U[2, :] / rho    # total specific energy (per unit mass)
+
+        if U.shape[1] != A.shape[0]:
+            Ause = A[2:-2]  # trim A to match U's spatial dimension if needed
+            Ause = 0.5*(Ause[:-1] + Ause[1:])  # average adjacent A values to get A at cell centers for better accuracy in primitives
+        else:
+            Ause = A
+
+        rho = U[0, :] / Ause
+        u   = U[1, :] / (rho * Ause)
+        E   = U[2, :] / (rho * Ause)    # total specific energy (per unit mass)
         
         p = rho * (k - 1.0) * (E - 0.5 * u*u)
         a = np.sqrt(k * p / rho)
         return rho, u, p, E, a
     
-    def initial_Riemann(U, A):
+    def initial_Riemann(U, A, left_initial, right_initial):
         shape = U.shape
+        Aext = np.zeros([3, shape[1]], dtype=np.float64)
+        Aext = np.tile(A, (3, 1))  # extend A to match U's spatial dimension if needed
 
-        rhoL = 1
-        pL = 1e6
-        uL = 0
+        rhoL = left_initial[0]
+        pL = left_initial[1]
+        uL = left_initial[2]
         left_state = np.array([rhoL, rhoL*uL, (pL/(k-1) + 0.5*rhoL*uL*uL)])  # (rho*A, rho*u*A, rho*E*A) left state
 
-        rhoR = 0.125
-        pR = 1e4
-        uR = 0
+        rhoR = right_initial[0]
+        pR = right_initial[1]
+        uR = right_initial[2]
         right_state = np.array([rhoR, rhoR*uR, (pR/(k-1) + 0.5*rhoR*uR*uR)])  # (rho*A, rho*u*A, rho*E*A) right state
         
         UL = np.repeat(left_state, shape[1]//2, axis=0).reshape(3, shape[1]//2)
         UR = np.repeat(right_state, shape[1]//2, axis=0).reshape(3, shape[1]//2)
 
         if shape[1] % 2 != 0:
-            U[:, :shape[1]//2, 0] = UL
-            U[:, shape[1]//2, 0] = (UL[:, -1] + UR[:, 0]) / 2  # set middle point to average of left and right states for better WENO reconstruction
-            U[:, shape[1]//2+1:, 0] = UR
+            U[:, :shape[1]//2, 0] = UL*Aext[:, :shape[1]//2]
+            U[:, shape[1]//2, 0] = Aext[:, shape[1]//2]*(UL[:, -1] + UR[:, 0]) / 2  # set middle point to average of left and right states for better WENO reconstruction
+            U[:, shape[1]//2+1:, 0] = UR*Aext[:, shape[1]//2+1:]
         else: 
-            U[:, :shape[1]//2, 0] = UL
-            U[:, shape[1]//2:, 0] = UR
+            U[:, :shape[1]//2, 0] = UL*Aext[:, :shape[1]//2]
+            U[:, shape[1]//2:, 0] = UR*Aext[:, shape[1]//2:]
         return U
 
 
-    def Riemann_BC(U):
+    def Riemann_BC(U, A):
+        if boundary_case == 'Riemann':
+            left_dst = np.array([2, 1, 0])
+            left_src = np.array([3, 4, 5])
+            U[:, left_dst] = U[:, left_src]
+            right_dst = np.array([-3, -2, -1])
+            right_src = np.array([-4, -5, -6])
+            U[:, right_dst] = U[:, right_src]
+            return U
+
         # Left boundary: rigid reflective wall.
         left_dst = np.array([2, 1, 0])
         left_src = np.array([3, 4, 5])
         U[:, left_dst] = U[:, left_src]
         U[1, left_dst] = -U[1, left_src]
+
 
         if boundary_case == 'wall-wall':
             # Right boundary: rigid reflective wall.
@@ -98,9 +117,9 @@ def simulate():
         # - Subsonic outflow: impose ambient pressure, extrapolate rho and u.
         # - Backflow: impose full ambient state.
         i_in = -4
-        rho_in = max(U[0, i_in], 1e-12)
-        u_in = U[1, i_in] / rho_in
-        E_in = U[2, i_in] / rho_in
+        rho_in = max(U[0, i_in], 1e-12) / A[i_in]  # avoid division by zero and negative density
+        u_in = U[1, i_in] / (rho_in * A[i_in])
+        E_in = U[2, i_in] / (rho_in * A[i_in])
         p_in = max(rho_in * (k - 1.0) * (E_in - 0.5 * u_in * u_in), 1.0)
         a_in = math.sqrt(k * p_in / rho_in)
 
@@ -121,12 +140,12 @@ def simulate():
             p_g = p0
 
         E_g = p_g / (k - 1.0) + 0.5 * rho_g * u_g * u_g
-        U[0, -3:] = rho_g
-        U[1, -3:] = rho_g * u_g
-        U[2, -3:] = E_g
+        U[0, -3:] = rho_g * A[-3:]  # assume area is constant at the boundary for simplicity; could also extrapolate A if needed
+        U[1, -3:] = rho_g * u_g * A[-3:]
+        U[2, -3:] = E_g * A[-3:]
         return U
     
-    def weno5_reconstruct(U):
+    def weno5_reconstruct(U, A):
         """
         Characteristic WENO5 reconstruction for 1D Euler variables.
 
@@ -143,7 +162,7 @@ def simulate():
         if nvar != 3:
             raise ValueError("Characteristic WENO5 here is implemented for 1D Euler with 3 conserved variables.")
 
-        eps = 1e-12
+        eps_weno = 1e-10
 
         def eno3_left_iphalf(w_im2, w_im1, w_i, w_ip1, w_ip2):
             p0 = (1.0 / 3.0) * w_im2 - (7.0 / 6.0) * w_im1 + (11.0 / 6.0) * w_i
@@ -152,13 +171,12 @@ def simulate():
 
             gamma1 = 1/10
             gamma2 = 3/5
-            gamma3 = 3/10
+            gamma3 = 3/10   
 
             beta1 = (13/12)*(w_im2 - 2*w_im1 + w_i)**2 + (1/4)*(w_im2 - 4*w_im1 + 3*w_i)**2
             beta2 = (13/12)*(w_im1 - 2*w_i + w_ip1)**2 + (1/4)*(w_im1 - w_ip1)**2
             beta3 = (13/12)*(w_i - 2*w_ip1 + w_ip2)**2 + (1/4)*(3*w_i - 4*w_ip1 + w_ip2)**2
 
-            eps_weno = 1e-6
             alpha1 = gamma1/(eps_weno + beta1)**2
             alpha2 = gamma2/(eps_weno + beta2)**2
             alpha3 = gamma3/(eps_weno + beta3)**2
@@ -178,11 +196,10 @@ def simulate():
             gamma2 = 3/5
             gamma3 = 1/10
 
-            beta1 = (13/12)*(w_im1 - 2*w_i + w_ip1)**2 + (1/4)*(3*w_im1 - 4*w_i + w_ip1)**2
+            beta1 = (13/12)*(w_im1 - 2*w_i + w_ip1)**2 + (1/4)*(w_im1 - 4*w_i + 3*w_ip1)**2
             beta2 = (13/12)*(w_i - 2*w_ip1 + w_ip2)**2 + (1/4)*(w_i - w_ip2)**2
-            beta3 = (13/12)*(w_ip1 - 2*w_ip2 + w_ip3)**2 + (1/4)*(w_ip1 - 4*w_ip2 + 3*w_ip3)**2
+            beta3 = (13/12)*(w_ip1 - 2*w_ip2 + w_ip3)**2 + (1/4)*(3*w_ip1 - 4*w_ip2 + w_ip3)**2
 
-            eps_weno = 1e-6
             alpha1 = gamma1/(eps_weno + beta1)**2
             alpha2 = gamma2/(eps_weno + beta2)**2
             alpha3 = gamma3/(eps_weno + beta3)**2
@@ -203,18 +220,21 @@ def simulate():
         u_ip1 = U[:, 4:m+4]
         u_ip2 = U[:, 5:m+5]
 
+        A_im1 = A[2:m+2]  # A at i-1 for primitives calculation
+        A_i = A[3:m+3]    # A at i for primitives calculation
+
         # rhoL = np.maximum(u_im1[0], eps)
-        rhoL = u_im1[0]
-        velL = u_im1[1] / rhoL
-        EL = u_im1[2] / rhoL
+        rhoL = u_im1[0] / A_im1
+        velL = u_im1[1] / (rhoL * A_im1)
+        EL = u_im1[2] / (rhoL * A_im1)
         # pL = np.maximum(rhoL * (k - 1.0) * (EL - 0.5 * velL * velL), eps)
         pL = rhoL * (k - 1.0) * (EL - 0.5 * velL * velL)
         HL = EL + pL / rhoL
 
         # rhoR = np.maximum(u_i[0], eps)
-        rhoR = u_i[0]
-        velR = u_i[1] / rhoR
-        ER = u_i[2] / rhoR
+        rhoR = u_i[0] / A_i
+        velR = u_i[1] / (rhoR * A_i)
+        ER = u_i[2] / (rhoR * A_i)
         # pR = np.maximum(rhoR * (k - 1.0) * (ER - 0.5 * velR * velR), eps)
         pR = rhoR * (k - 1.0) * (ER - 0.5 * velR * velR)
         HR = ER + pR / rhoR
@@ -254,15 +274,13 @@ def simulate():
 
         w_uL = eno3_left_iphalf(wm_im3, wm_im2, wm_im1, wm_i, wm_ip1)
         w_uR = eno3_right_iphalf(wm_im2, wm_im1, wm_i, wm_ip1, wm_ip2)
-
         UL = np.einsum('mab,bm->am', P, w_uL)
         UR = np.einsum('mab,bm->am', P, w_uR)
-
         return UL, UR, eigenvals
     
     # Wave speed
     def max_wave_speed_Toro(U, A, case):
-        UL, UR, _ = weno5_reconstruct(U)
+        UL, UR, _ = weno5_reconstruct(U, A)
 
         rhoL, uL, pL, _, aL = primitives(UL, A)  # primitives at x_{i-1/2} left state
         rhoR, uR, pR, _, aR = primitives(UR, A)  # primitives at x_{i-1/2} right state
@@ -291,16 +309,24 @@ def simulate():
             return SL, SR
 
     def Euler_flux(U, A):
+        if U.shape[1] != A.shape[0]:
+            Ause = A[2:-2]  # trim A to match U's spatial dimension if needed
+            Ause = 0.5*(Ause[:-1] + Ause[1:])  # Area at the interfaces, averaged for better accuracy in flux calculation
+        else:
+            Ause = A
         rho, u, p, E, a = primitives(U, A)
-        return np.vstack((rho*u, rho*u**2 + p, u*(rho*E + p)))
+        return np.vstack((rho*u*Ause, (rho*u**2 + p)*Ause, u*(rho*E + p)*Ause))
 
     def HLLC_flux(U, A):
-        UL, UR, eigenvals = weno5_reconstruct(U)
+        UL, UR, eigenvals = weno5_reconstruct(U, A)
         rhoL, uL, pL, EL, aL = primitives(UL, A)  # primitives at left state
         rhoR, uR, pR, ER, aR = primitives(UR, A)  # primitives at right state
 
         fL = Euler_flux(UL, A)
         fR = Euler_flux(UR, A)
+
+        Ause = A[2:-2]
+        Ause = 0.5*(Ause[:-1] + Ause[1:])
 
         # if wave_speed_method == 'Dava':
         #     SL = np.minimum(np.min(eigenvals, axis=0), 0)  # Davidson's HLL wave speed estimates
@@ -310,8 +336,8 @@ def simulate():
 
         Sstar = (pR - pL + rhoL*uL*(SL-uL) - rhoR*uR*(SR-uR))/(rhoL*(SL-uL) - rhoR*(SR-uR))
 
-        UstarL = rhoL * (SL - uL) / (SL - Sstar) * np.array([np.ones(SL.shape), Sstar, EL + (Sstar - uL)*(Sstar + pL/(rhoL*(SL-uL)))])
-        UstarR = rhoR * (SR - uR) / (SR - Sstar) * np.array([np.ones(SR.shape), Sstar, ER + (Sstar - uR)*(Sstar + pR/(rhoR*(SR-uR)))])
+        UstarL = Ause * rhoL * (SL - uL) / (SL - Sstar) * np.array([np.ones(SL.shape), Sstar, EL + (Sstar - uL)*(Sstar + pL/(rhoL*(SL-uL)))])
+        UstarR = Ause * rhoR * (SR - uR) / (SR - Sstar) * np.array([np.ones(SR.shape), Sstar, ER + (Sstar - uR)*(Sstar + pR/(rhoR*(SR-uR)))])
         fstarL = fL + SL * (UstarL - UL)
         fstarR = fR + SR * (UstarR - UR)
 
@@ -332,6 +358,24 @@ def simulate():
         fp = f[:, 1:]   # flux at i+1/2
 
         return fm, fp
+    
+    def source_term(U, A):
+        # source term for variable area: S = [0, pdA/dx, 0]
+        if A.shape[0] == U.shape[1]:
+            Arel = A[2:-2]  # interior+near-boundary cells aligned with flux stencil
+        else:
+            Arel = A
+
+        Ainterface = 0.5 * (Arel[1:] + Arel[:-1])
+        dAdx = (Ainterface[1:] - Ainterface[:-1]) / dx  # length nx-6
+
+        _, _, p, _, _ = primitives(U, A)
+        p = p[3:-3]  # cell-centered pressure for updated cells (length nx-6)
+
+        # For quasi-1D Euler with U=[rho*A, rho*u*A, rho*E*A], only momentum has source.
+        S = np.zeros((3, p.shape[0]), dtype=np.float64)
+        S[1, :] = p * dAdx
+        return S
 
 
     def find_dt(U, A, dx, cfl):
@@ -347,29 +391,29 @@ def simulate():
         U4 = np.zeros((3, nx), dtype=np.float64)
 
         # shock reflection NOT depicted accurately for now due to sboundary conditions
-        U = Riemann_BC(U)
+        U = Riemann_BC(U, A)
         fm, fp = HLLC_flux(U, A)
-        k1 = -1/dx * (fp - fm)
+        k1 = -1/dx * (fp - fm) + source_term(U, A)
         U1[:, 3:nx-3] = U[:, 3:nx-3] + 0.391752226571890*dt*k1
 
-        U1 = Riemann_BC(U1)
+        U1 = Riemann_BC(U1, A)
         fm, fp = HLLC_flux(U1, A)
-        k2 = -1/dx * (fp - fm)
+        k2 = -1/dx * (fp - fm) + source_term(U1, A)
         U2[:, 3:nx-3] = 0.444370493651235*U[:, 3:nx-3] + 0.555629506348765*U1[:, 3:nx-3] + 0.368410593050371*dt*k2
 
-        U2 = Riemann_BC(U2)
+        U2 = Riemann_BC(U2, A)
         fm, fp = HLLC_flux(U2, A)
-        k3 = -1/dx * (fp - fm)
+        k3 = -1/dx * (fp - fm) + source_term(U2, A)
         U3[:, 3:nx-3] = 0.620101851488403*U[:, 3:nx-3] + 0.379898148511597*U2[:, 3:nx-3] + 0.251891774271694*dt*k3
 
-        U3 = Riemann_BC(U3)
+        U3 = Riemann_BC(U3, A)
         fm, fp = HLLC_flux(U3, A)
-        k4 = -1/dx * (fp - fm)
+        k4 = -1/dx * (fp - fm) + source_term(U3, A)
         U4[:, 3:nx-3] = 0.178079954393132*U[:, 3:nx-3] + 0.821920045606868*U3[:, 3:nx-3] +  0.544974750228521*dt*k4
 
-        U4 = Riemann_BC(U4)
+        U4 = Riemann_BC(U4, A)
         fm, fp = HLLC_flux(U4, A)
-        k5 = -1/dx * (fp - fm)
+        k5 = -1/dx * (fp - fm) + source_term(U4, A)
         Unp1 = 0.517231671970585*U2[:, 3:nx-3] + 0.096059710526147*U3[:, 3:nx-3] + 0.063692468666290*dt*k4 + 0.386708617503268*U4[:, 3:nx-3] + 0.226007483236906*dt*k5
 
         return Unp1
@@ -380,7 +424,7 @@ def simulate():
 
         rho, u, p, E, a = primitives(Un, A)
 
-        os.makedirs(f"cfl{cfl}_{wave_speed_method}", exist_ok=True)
+        os.makedirs(f"cfl{cfl}_{boundary_case}_case{case}_time{t_end}", exist_ok=True)
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
         # for i in range(0, n+1, max(1, n//10)):
@@ -394,7 +438,7 @@ def simulate():
         ax.set_xlim(left=0.0)
         ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
-        plt.savefig(f"cfl{cfl}_{wave_speed_method}/rho_end.png")
+        plt.savefig(f"cfl{cfl}_{boundary_case}_case{case}_time{t_end}/rho_end.png")
         # plt.clf()
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
@@ -409,7 +453,7 @@ def simulate():
         ax.set_xlim(left=0.0)
         ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
-        plt.savefig(f"cfl{cfl}_{wave_speed_method}/p_end.png")
+        plt.savefig(f"cfl{cfl}_{boundary_case}_case{case}_time{t_end}/p_end.png")
         # plt.clf()
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
@@ -424,7 +468,7 @@ def simulate():
         ax.set_xlim(left=0.0)
         # ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
-        plt.savefig(f"cfl{cfl}_{wave_speed_method}/u_end.png")
+        plt.savefig(f"cfl{cfl}_{boundary_case}_case{case}_time{t_end}/u_end.png")
         # plt.clf()
     
     # Main simulation loop
@@ -434,12 +478,14 @@ def simulate():
 
     # State
     t = 0.0
-    t_end = 6e-5
-    nx = 2000
+    # t_end = 6e-4
+    nx = 600
     dx = 1 / (nx - 6)
     cfl = 0.9
     wave_speed_method = 'Toro'  # 'Dava' or 'Toro'
-    boundary_case = 'wall-wall'  # 'wall-wall' or 'wall-atmosphere'
+    boundary_case = 'Riemann'  # 'wall-wall' or 'wall-atmosphere'
+    case = 8
+
     print_progress = True
 
     # Atmospheric conditions used when boundary_case = 'wall-atmosphere'.
@@ -450,24 +496,31 @@ def simulate():
     if abs(p0_check - p0) / p0 > 5e-2:
         print(f"Warning: p0, rho0, T0 are not fully consistent with ideal gas: rho0*R*T={p0_check:.2f} Pa")
 
+    left_initial, right_initial, t_end = test_case(case)
+    # t_end = 0.008
+
     # Variables to track over time
     U = np.zeros((3, nx, 200000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step
     Unext = np.zeros((3, nx), dtype=np.float64)  # temporary array for next time step to avoid huge allocations inside SSPRK45
     Ulast = np.zeros((3, nx), dtype=np.float64)  # temporary array for current time step to avoid huge allocations inside SSPRK45
-    A = np.ones([1])  # test cross-sectional area
+    A = np.ones(nx, dtype=np.float64)  # test cross-sectional area
+    # if nx % 2 == 0:
+    #     A = np.concatenate((1*np.ones(nx//2), 2*np.ones(nx//2)))  # add ghost cells for BCs
+    # else:
+    #     A = np.concatenate((1*np.ones(nx//2), 2*np.ones(nx//2+1)))  # add ghost cells for BCs 
 
     # Outputs
     t_list = [t]
     
     n = 0
-    U = initial_Riemann(U, A)
-    U[:, :, 0] = Riemann_BC(U[:, :, 0])
+    U = initial_Riemann(U, A, left_initial, right_initial)
+    U[:, :, 0] = Riemann_BC(U[:, :, 0], A)
 
     while t < t_end:
         Ulast = U[:, :, n]
         dt = find_dt(Ulast, A, dx, cfl)
         Unext[:, 3:nx-3] = SSPRK45(Ulast, A, dt, dx, nx)
-        Unext = Riemann_BC(Unext)  # Apply BCs to the new state before storing it
+        Unext = Riemann_BC(Unext, A)  # Apply BCs to the new state before storing it
         U[:, :, n+1] = Unext
         t += dt
         n += 1

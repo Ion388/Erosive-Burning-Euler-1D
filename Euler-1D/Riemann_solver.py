@@ -53,13 +53,13 @@ def simulate():
         shape = U.shape
 
         rhoL = 1
-        pL = 1e5
-        uL = 0
+        pL = 0.4
+        uL = -2
         left_state = np.array([rhoL, rhoL*uL, (pL/(k-1) + 0.5*rhoL*uL*uL)])  # (rho*A, rho*u*A, rho*E*A) left state
 
-        rhoR = 0.125
-        pR = 1e4
-        uR = 0
+        rhoR = 1
+        pR = 0.4
+        uR = 2
         right_state = np.array([rhoR, rhoR*uR, (pR/(k-1) + 0.5*rhoR*uR*uR)])  # (rho*A, rho*u*A, rho*E*A) right state
         
         UL = np.repeat(left_state, shape[1]//2, axis=0).reshape(3, shape[1]//2)
@@ -80,14 +80,14 @@ def simulate():
         left_dst = np.array([2, 1, 0])
         left_src = np.array([3, 4, 5])
         U[:, left_dst] = U[:, left_src]
-        U[1, left_dst] = -U[1, left_src]
+        # U[1, left_dst] = -U[1, left_src]
 
         if boundary_case == 'wall-wall':
             # Right boundary: rigid reflective wall.
             right_dst = np.array([-3, -2, -1])
             right_src = np.array([-4, -5, -6])
             U[:, right_dst] = U[:, right_src]
-            U[1, right_dst] = -U[1, right_src]
+            # U[1, right_dst] = -U[1, right_src]
             return U
 
         if boundary_case != 'wall-atmosphere':
@@ -178,9 +178,9 @@ def simulate():
             gamma2 = 3/5
             gamma3 = 1/10
 
-            beta1 = (13/12)*(w_im1 - 2*w_i + w_ip1)**2 + (1/4)*(3*w_im1 - 4*w_i + w_ip1)**2
+            beta1 = (13/12)*(w_im1 - 2*w_i + w_ip1)**2 + (1/4)*(w_im1 - 4*w_i + 3*w_ip1)**2
             beta2 = (13/12)*(w_i - 2*w_ip1 + w_ip2)**2 + (1/4)*(w_i - w_ip2)**2
-            beta3 = (13/12)*(w_ip1 - 2*w_ip2 + w_ip3)**2 + (1/4)*(w_ip1 - 4*w_ip2 + 3*w_ip3)**2
+            beta3 = (13/12)*(w_ip1 - 2*w_ip2 + w_ip3)**2 + (1/4)*(3*w_ip1 - 4*w_ip2 + w_ip3)**2
 
             eps_weno = 1e-6
             alpha1 = gamma1/(eps_weno + beta1)**2
@@ -434,8 +434,8 @@ def simulate():
 
     # State
     t = 0.0
-    t_end = 6e-5
-    nx = 600
+    t_end = 0.017
+    nx = 1001
     dx = 1 / (nx - 6)
     cfl = 0.9
     wave_speed_method = 'Toro'  # 'Dava' or 'Toro'
