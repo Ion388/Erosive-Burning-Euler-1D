@@ -16,9 +16,9 @@ import sys
 from Riemann_test_cases import test_case
 
 # Hint BLAS/OpenMP backends to use all CPU threads for vectorized kernels.
-os.environ.setdefault("OMP_NUM_THREADS", "16")
-os.environ.setdefault("MKL_NUM_THREADS", "16")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "16")
+os.environ.setdefault("OMP_NUM_THREADS", "8")
+os.environ.setdefault("MKL_NUM_THREADS", "8")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "8")
 
 import numpy as np
 from typing import Dict, List, Tuple
@@ -85,6 +85,17 @@ def simulate():
 
 
     def Riemann_BC(U, A):
+
+        if boundary_case == 'Riemann-wall':
+            left_dst = np.array([2, 1, 0])
+            left_src = np.array([3, 4, 5])
+            U[:, left_dst] = U[:, left_src]
+            right_dst = np.array([-3, -2, -1])
+            right_src = np.array([-4, -5, -6])
+            U[:, right_dst] = U[:, right_src]
+            U[1, right_dst] = -U[1, right_dst]  # reflective wall on the right side
+            return U
+
         if boundary_case == 'Riemann':
             left_dst = np.array([2, 1, 0])
             left_src = np.array([3, 4, 5])
@@ -110,17 +121,17 @@ def simulate():
             return U
 
         if boundary_case != 'wall-atmosphere':
-            raise ValueError("boundary_case must be 'wall-wall' or 'wall-atmosphere'.")
+            raise ValueError("boundary_case must be 'Riemann-wall' or 'wall-wall' or 'wall-atmosphere'.")
 
         # Right boundary: atmospheric outlet/inlet.
         # - Supersonic outflow: all characteristics leave, use zero-gradient.
         # - Subsonic outflow: impose ambient pressure, extrapolate rho and u.
         # - Backflow: impose full ambient state.
         i_in = -4
-        rho_in = max(U[0, i_in], 1e-12) / A[i_in]  # avoid division by zero and negative density
+        rho_in = U[0, i_in] / A[i_in]  # avoid division by zero and negative density
         u_in = U[1, i_in] / (rho_in * A[i_in])
         E_in = U[2, i_in] / (rho_in * A[i_in])
-        p_in = max(rho_in * (k - 1.0) * (E_in - 0.5 * u_in * u_in), 1.0)
+        p_in = rho_in * (k - 1.0) * (E_in - 0.5 * u_in * u_in)
         a_in = math.sqrt(k * p_in / rho_in)
 
         if u_in >= a_in:
@@ -358,31 +369,62 @@ def simulate():
         fp = f[:, 1:]   # flux at i+1/2
 
         return fm, fp
-    
-    def source_term(U, A):
-        # source term for variable area: S = [0, pdA/dx, 0]
-        if A.shape[0] == U.shape[1]:
-            Arel = A[2:-2]  # interior+near-boundary cells aligned with flux stencil
-        else:
-            Arel = A
 
-        Ainterface = 0.5 * (Arel[1:] + Arel[:-1])
+    def AP_map(A0, dtrb):
+        r0 = np.sqrt(A0/np.pi)
+        A1 = np.pi * (r0 + dtrb)**2
+        P1 = 2 * np.sqrt(A1 * np.pi)
+        return A1, P1
+
+    def fill_geometry_ghosts(A, P):
+        # linear extrapolation for better accuracylinear extrapolation for better accuracy
+        A[2] = A[3] - (A[4] - A[3])
+        A[1] = A[3] - 2*(A[4] - A[3])
+        A[0] = A[3] - 3*(A[4] - A[3])
+
+        A[-3] = A[-4] - (A[-5] - A[-4])
+        A[-2] = A[-4] - 2*(A[-5] - A[-4])
+        A[-1] = A[-4] - 3*(A[-5] - A[-4])
+
+        P[2] = P[3] - (P[4] - P[3])
+        P[1] = P[3] - 2*(P[4] - P[3])
+        P[0] = P[3] - 3*(P[4] - P[3])
+
+        P[-3] = P[-4] - (P[-5] - P[-4])
+        P[-2] = P[-4] - 2*(P[-5] - P[-4])
+        P[-1] = P[-4] - 3*(P[-5] - P[-4])
+
+        return A, P
+
+    
+    def source_term(U, A, P, dt):
+        _, _, p, _, _ = primitives(U, A)
+
+        Ainterface = 0.5 * (A[3:-2] + A[2:-3])
         dAdx = (Ainterface[1:] - Ainterface[:-1]) / dx  # length nx-6
 
-        _, _, p, _, _ = primitives(U, A)
-        p = p[3:-3]  # cell-centered pressure for updated cells (length nx-6)
+        S = np.zeros((3, p[3:-3].shape[0]), dtype=np.float64)
+        S[1, :] = p[3:-3] * dAdx
 
-        # For quasi-1D Euler with U=[rho*A, rho*u*A, rho*E*A], only momentum has source.
-        S = np.zeros((3, p.shape[0]), dtype=np.float64)
-        S[1, :] = p * dAdx
-        return S
+        A1 = A.copy()
+        P1 = P.copy()
+
+        if erosive == True:
+            rb = arb * p[3:-3]**nrb  # example burning rate r = a*p^n, with a=0.01, n=0.5
+            Sburn = dx * P[3:-3]
+            S[0, :] = rb * Sburn * rhoprop  # mass loss from burning, proportional to pressure and burning area
+            S[2, :] = rb * Sburn * rhoprop * hreaction  # energy release from burning, proportional to pressure and burning area
+            A1[3:-3], P1[3:-3] = AP_map(A[3:-3], dt*rb)  # update interior geometry
+            A1, P1 = fill_geometry_ghosts(A1, P1)
+        
+        return S, A1, P1
 
 
     def find_dt(U, A, dx, cfl):
         llam = max_wave_speed_Toro(U, A, case='dt')
         return cfl * dx / llam if llam > 0 else 1e-6
     
-    def SSPRK45(U, A, dt, dx, nx):
+    def SSPRK45(U, A, P, dt, dx, nx):
 
         # Keep only one stage index to avoid huge allocations each time step.
         U1 = np.zeros((3, nx), dtype=np.float64)
@@ -393,30 +435,35 @@ def simulate():
         # shock reflection NOT depicted accurately for now due to sboundary conditions
         U = Riemann_BC(U, A)
         fm, fp = HLLC_flux(U, A)
-        k1 = -1/dx * (fp - fm) + source_term(U, A)
+        S1, A1, P1 = source_term(U, A, P, dt)
+        k1 = -1/dx * (fp - fm) + S1
         U1[:, 3:nx-3] = U[:, 3:nx-3] + 0.391752226571890*dt*k1
 
-        U1 = Riemann_BC(U1, A)
-        fm, fp = HLLC_flux(U1, A)
-        k2 = -1/dx * (fp - fm) + source_term(U1, A)
+        U1 = Riemann_BC(U1, A1)
+        fm, fp = HLLC_flux(U1, A1)
+        S2, A2, P2 = source_term(U1, A1, P1, dt)
+        k2 = -1/dx * (fp - fm) + S2
         U2[:, 3:nx-3] = 0.444370493651235*U[:, 3:nx-3] + 0.555629506348765*U1[:, 3:nx-3] + 0.368410593050371*dt*k2
 
-        U2 = Riemann_BC(U2, A)
-        fm, fp = HLLC_flux(U2, A)
-        k3 = -1/dx * (fp - fm) + source_term(U2, A)
+        U2 = Riemann_BC(U2, A2)
+        fm, fp = HLLC_flux(U2, A2)
+        S3, A3, P3 = source_term(U2, A2, P2, dt)
+        k3 = -1/dx * (fp - fm) + S3
         U3[:, 3:nx-3] = 0.620101851488403*U[:, 3:nx-3] + 0.379898148511597*U2[:, 3:nx-3] + 0.251891774271694*dt*k3
 
-        U3 = Riemann_BC(U3, A)
-        fm, fp = HLLC_flux(U3, A)
-        k4 = -1/dx * (fp - fm) + source_term(U3, A)
+        U3 = Riemann_BC(U3, A3)
+        fm, fp = HLLC_flux(U3, A3)
+        S4, A4, P4 = source_term(U3, A3, P3, dt)
+        k4 = -1/dx * (fp - fm) + S4
         U4[:, 3:nx-3] = 0.178079954393132*U[:, 3:nx-3] + 0.821920045606868*U3[:, 3:nx-3] +  0.544974750228521*dt*k4
 
-        U4 = Riemann_BC(U4, A)
-        fm, fp = HLLC_flux(U4, A)
-        k5 = -1/dx * (fp - fm) + source_term(U4, A)
+        U4 = Riemann_BC(U4, A4)
+        fm, fp = HLLC_flux(U4, A4)
+        S5, A5, P5 = source_term(U4, A4, P4, dt)
+        k5 = -1/dx * (fp - fm) + S5
         Unp1 = 0.517231671970585*U2[:, 3:nx-3] + 0.096059710526147*U3[:, 3:nx-3] + 0.063692468666290*dt*k4 + 0.386708617503268*U4[:, 3:nx-3] + 0.226007483236906*dt*k5
 
-        return Unp1
+        return Unp1, A5, P5
     
     def plot(U, A, n):
 
@@ -424,13 +471,13 @@ def simulate():
 
         rho, u, p, E, a = primitives(Un, A)
 
-        os.makedirs(f"cfl{cfl}_{boundary_case}_case{case}_time{t_end}", exist_ok=True)
+        os.makedirs(f"cfl{cfl}_c{case}_{boundary_case}_t{t_end}_x{xdom}", exist_ok=True)
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
         # for i in range(0, n+1, max(1, n//10)):
         #     rho_i, u_i, p_i, _, _ = primitives(U, A, i)
         #     ax.plot(rho_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
-        ax.plot(rho, linewidth=4, color=line_color)
+        ax.plot(xlist, rho, linewidth=4, color=line_color)
         ax.set_ylabel("Densitate rho", fontsize=label_size)
         ax.set_xlabel("x [m]", fontsize=label_size)
         ax.tick_params(axis='both', which='major', labelsize=tick_size)
@@ -438,14 +485,14 @@ def simulate():
         ax.set_xlim(left=0.0)
         ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
-        plt.savefig(f"cfl{cfl}_{boundary_case}_case{case}_time{t_end}/rho_end.png")
-        # plt.clf()
+        plt.savefig(f"cfl{cfl}_c{case}_{boundary_case}_t{t_end}_x{xdom}/rho_end.png")
+        plt.clf()
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
         # for i in range(0, n+1, max(1, n//10)):
         #     rho_i, u_i, p_i, _, _ = primitives(U, A, i)
         #     ax.plot(p_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
-        ax.plot(p, linewidth=4, color=line_color)
+        ax.plot(xlist, p, linewidth=4, color=line_color)
         ax.set_ylabel("Presiune p [Pa]", fontsize=label_size)
         ax.set_xlabel("x [m]", fontsize=label_size)
         ax.tick_params(axis='both', which='major', labelsize=tick_size)
@@ -453,14 +500,14 @@ def simulate():
         ax.set_xlim(left=0.0)
         ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
-        plt.savefig(f"cfl{cfl}_{boundary_case}_case{case}_time{t_end}/p_end.png")
+        plt.savefig(f"cfl{cfl}_c{case}_{boundary_case}_t{t_end}_x{xdom}/p_end.png")
         # plt.clf()
 
         fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
         # for i in range(0, n+1, max(1, n//10)):
         #     rho_i, u_i, p_i, _, _ = primitives(U, A, i)
         #     ax.plot(u_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
-        ax.plot(u, linewidth=4, color=line_color)
+        ax.plot(xlist, u, linewidth=4, color=line_color)
         ax.set_ylabel("Viteza u [m/s]", fontsize=label_size)
         ax.set_xlabel("x [m]", fontsize=label_size)
         ax.tick_params(axis='both', which='major', labelsize=tick_size)
@@ -468,7 +515,38 @@ def simulate():
         ax.set_xlim(left=0.0)
         # ax.set_ylim(bottom=0.0)
         ax.set_aspect(ar)
-        plt.savefig(f"cfl{cfl}_{boundary_case}_case{case}_time{t_end}/u_end.png")
+        plt.savefig(f"cfl{cfl}_c{case}_{boundary_case}_t{t_end}_x{xdom}/u_end.png")
+        # plt.clf()
+
+        fig, ax = plt.subplots(figsize=(height, width), dpi=dpi)
+        # for i in range(0, n+1, max(1, n//10)):
+        #     rho_i, u_i, p_i, _, _ = primitives(U, A, i)
+        #     ax.plot(u_i, linewidth=2, label=f"t={t_list[i]:.2e}s")
+        ax.plot(xlist, u/a, linewidth=4, color=line_color)
+        ax.set_ylabel("Numarul Mach M [m/s]", fontsize=label_size)
+        ax.set_xlabel("x [m]", fontsize=label_size)
+        ax.tick_params(axis='both', which='major', labelsize=tick_size)
+        ax.grid(True)
+        ax.set_xlim(left=0.0)
+        # ax.set_ylim(bottom=0.0)
+        ax.set_aspect(ar)
+        plt.savefig(f"cfl{cfl}_c{case}_{boundary_case}_t{t_end}_x{xdom}/M_end.png")
+        # plt.clf()
+
+        fig = plt.figure(figsize=(height, width), dpi=dpi)
+        ax = fig.add_subplot(111, projection='3d')
+        t_surface = np.asarray(t_list, dtype=np.float64)
+        Tgrid, Xgrid = np.meshgrid(t_surface, xlist, indexing='ij')
+        Agrid = A_printlist
+        surf = ax.plot_surface(Xgrid, Tgrid, Agrid, cmap='inferno', linewidth=0, antialiased=True)
+        fig.colorbar(surf, ax=ax, shrink=0.7, pad=0.1, label='Aria [m^2]')
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("Timp [s]")
+        ax.set_zlabel("Aria [m^2]")
+        ax.tick_params(axis='both', which='major')
+        ax.view_init(elev=25, azim=-130)
+        plt.savefig(f"cfl{cfl}_c{case}_{boundary_case}_t{t_end}_x{xdom}/A_end.png")
+        # plt.show()
         # plt.clf()
     
     # Main simulation loop
@@ -478,63 +556,82 @@ def simulate():
 
     # State
     t = 0.0
-    # t_end = 6e-4
-    nx = 600
-    dx = 1 / (nx - 6)
+    nx = 1001
     cfl = 0.9
-    wave_speed_method = 'Toro'  # 'Dava' or 'Toro'
-    boundary_case = 'Riemann'  # 'wall-wall' or 'wall-atmosphere'
-    case = 8
+    arb = 0.01  # burning rate coefficient for source term example
+    nrb = 0.5   # burning rate exponent for source term example
+    rhoprop = 1800  # propellant density for source term example
+    hreaction = 3e6  # reaction heat release for source term example
+    erosive = False
 
     print_progress = True
 
-    # Atmospheric conditions used when boundary_case = 'wall-atmosphere'.
-    p0 = 100000  # Pa
-    rho0 = 1.000   # kg/m^3
-    T0 = 348    # K
-    p0_check = rho0 * Rgas * T0
-    if abs(p0_check - p0) / p0 > 5e-2:
-        print(f"Warning: p0, rho0, T0 are not fully consistent with ideal gas: rho0*R*T={p0_check:.2f} Pa")
 
-    left_initial, right_initial, t_end = test_case(case)
-    # t_end = 0.008
-
-    # Variables to track over time
-    U = np.zeros((3, nx, 200000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step
-    Unext = np.zeros((3, nx), dtype=np.float64)  # temporary array for next time step to avoid huge allocations inside SSPRK45
-    Ulast = np.zeros((3, nx), dtype=np.float64)  # temporary array for current time step to avoid huge allocations inside SSPRK45
-    A = np.ones(nx, dtype=np.float64)  # test cross-sectional area
-    # if nx % 2 == 0:
-    #     A = np.concatenate((1*np.ones(nx//2), 2*np.ones(nx//2)))  # add ghost cells for BCs
-    # else:
-    #     A = np.concatenate((1*np.ones(nx//2), 2*np.ones(nx//2+1)))  # add ghost cells for BCs 
-
-    # Outputs
-    t_list = [t]
     
-    n = 0
-    U = initial_Riemann(U, A, left_initial, right_initial)
-    U[:, :, 0] = Riemann_BC(U[:, :, 0], A)
 
-    while t < t_end:
-        Ulast = U[:, :, n]
-        dt = find_dt(Ulast, A, dx, cfl)
-        Unext[:, 3:nx-3] = SSPRK45(Ulast, A, dt, dx, nx)
-        Unext = Riemann_BC(Unext, A)  # Apply BCs to the new state before storing it
-        U[:, :, n+1] = Unext
-        t += dt
-        n += 1
+    # Atmospheric conditions used when boundary_case = 'wall-atmosphere'.
+    # p0 = 100000  # Pa
+    # rho0 = 1.000   # kg/m^3
+    # T0 = 348    # K
+    # p0_check = rho0 * Rgas * T0
+    # if abs(p0_check - p0) / p0 > 5e-2:
+    #     print(f"Warning: p0, rho0, T0 are not fully consistent with ideal gas: rho0*R*T={p0_check:.2f} Pa")
 
-        # Store outputs
-        t_list.append(t)
-        if print_progress:
-            print(t)
-        # print(dt)
+    test_cases = np.arange(1, 8)
+    # test_cases = [8] # for quick testing; comment out to run all cases
 
-    t_list = np.asarray(t_list, dtype=np.float64)
-    U = U[:, :, :n+1]
-    plot(U, A, n)
-    # plt.show()
+    for i in test_cases:
+        t = 0.0
+        case = i
+        left_initial, right_initial, t_end, xdom, boundary_case = test_case(case)
+        dx = xdom / (nx - 6)
+        xlist = np.linspace(0.0, xdom, nx)  # include ghost cells for BCs
+
+        # Variables to track over time
+        U = np.zeros((3, nx, 200000), dtype=np.float64)  # U[0] = rho*A, U[1] = rho*u*A, U[2] = E*A; shape (nvar, nx, nt) with ghost cells for BCs; will slice to current time step
+        Unext = np.zeros((3, nx), dtype=np.float64)  # temporary array for next time step to avoid huge allocations inside SSPRK45
+        Ulast = np.zeros((3, nx), dtype=np.float64)  # temporary array for current time step to avoid huge allocations inside SSPRK45
+        A = np.ones(nx, dtype=np.float64)  # test cross-sectional area
+        P = 2*np.sqrt(np.pi)*np.ones(nx, dtype=np.float64)
+        # if nx % 2 == 0:
+        #     # A = np.concatenate((1*np.ones(nx//2), 2*np.ones(nx//2)))  # add ghost cells for BCs
+        #     A = np.sin(np.linspace(0, np.pi/2, nx)) + 1  # example variable area for testing; shift up to ensure positivity
+        # else:
+        #     # A = np.concatenate((1*np.ones(nx//2), 2*np.ones(nx//2+1)))  # add ghost cells for BCs 
+        #     A = np.sin(np.linspace(0, np.pi/2, nx)) + 1
+        A, P = fill_geometry_ghosts(A, P)
+        A_printlist = np.array([A])  # store initial geometry for plotting; will be updated in source_term if erosive=True
+        P_printlist = np.array([P])  # store initial geometry for plotting; will be updated in source_term if erosive=True
+
+        # Outputs
+        t_list = [t]
+        
+        n = 0
+        U = initial_Riemann(U, A, left_initial, right_initial)
+        U[:, :, 0] = Riemann_BC(U[:, :, 0], A)
+
+        while t < t_end:
+            Ulast = U[:, :, n]
+            dt = find_dt(Ulast, A, dx, cfl)
+            Unext[:, 3:nx-3], A, P = SSPRK45(Ulast, A, P, dt, dx, nx)
+            Unext = Riemann_BC(Unext, A)  # Apply BCs to the new state before storing it
+            U[:, :, n+1] = Unext
+            t += dt
+            n += 1
+
+            # Store outputs
+            A_printlist = np.append(A_printlist, A.copy())  # store geometry at each time step for plotting; will be updated in source_term if erosive=True
+            P_printlist = np.append(P_printlist, P.copy())  # store geometry at each time step for plotting; will be updated in source_term if erosive=True   
+            t_list.append(t)
+            if print_progress:
+                print(t)
+        A_printlist = np.reshape(A_printlist, (-1, nx))
+        P_printlist = np.reshape(P_printlist, (-1, nx))
+
+        t_list = np.asarray(t_list, dtype=np.float64)
+        U = U[:, :, :n+1]
+        plot(U, A, n)
+        # plt.show()
 
 
 if __name__ == "__main__":
