@@ -44,12 +44,18 @@ import numpy as np
 # for j, ic in enumerate(range(4, 10)):
 #     print(f"j={j}, ic={ic}")
 
-np.random.seed(42)
-eigenvals_m = np.random.rand(3, 10)  # (nvar, nx)
-eigenvals_p = np.random.rand(3, 10)  # (nvar, nx)
-print(eigenvals_m)
-print(eigenvals_p)
-for i in range(eigenvals_m.shape[1]):
-    alpha_m = np.max(np.abs([eigenvals_m, eigenvals_p]), axis=0) #Toro
+# np.random.seed(42)
+# eigenvals_m = np.random.rand(3, 10)  # (nvar, nx)
+# eigenvals_p = np.random.rand(3, 10)  # (nvar, nx)
+# print(eigenvals_m)
+# print(eigenvals_p)
+# for i in range(eigenvals_m.shape[1]):
+#     alpha_m = np.max(np.abs([eigenvals_m, eigenvals_p]), axis=0) #Toro
 
-print(alpha_m)
+# print(alpha_m)
+
+a = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+# print(a[-4:])
+slicee = slice(3, -3)
+print(a[slicee.start:slicee.stop+1])
+# print(a[slicee])

@@ -53,13 +53,13 @@ def simulate():
         shape = U.shape
 
         rhoL = 1
-        pL = 0.4
-        uL = -2
+        pL = 1e5
+        uL = 0
         left_state = np.array([rhoL, rhoL*uL, (pL/(k-1) + 0.5*rhoL*uL*uL)])  # (rho*A, rho*u*A, rho*E*A) left state
 
-        rhoR = 1
-        pR = 0.4
-        uR = 2
+        rhoR = 0.125
+        pR = 1e4
+        uR = 0
         right_state = np.array([rhoR, rhoR*uR, (pR/(k-1) + 0.5*rhoR*uR*uR)])  # (rho*A, rho*u*A, rho*E*A) right state
         
         UL = np.repeat(left_state, shape[1]//2, axis=0).reshape(3, shape[1]//2)
@@ -434,7 +434,7 @@ def simulate():
 
     # State
     t = 0.0
-    t_end = 0.017
+    t_end = 6e-4
     nx = 1001
     dx = 1 / (nx - 6)
     cfl = 0.9
