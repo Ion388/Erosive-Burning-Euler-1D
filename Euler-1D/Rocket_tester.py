@@ -15,9 +15,9 @@ from Riemann_test_cases import test_case
 from input_VegaE import *
 
 # Hint BLAS/OpenMP backends to use all CPU threads for vectorized kernels.
-os.environ.setdefault("OMP_NUM_THREADS", "16")
-os.environ.setdefault("MKL_NUM_THREADS", "16")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "16")
+os.environ.setdefault("OMP_NUM_THREADS", "20")
+os.environ.setdefault("MKL_NUM_THREADS", "20")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "20")
 
 import numpy as np
 from typing import Dict, List, Tuple
@@ -48,26 +48,30 @@ def simulate():
         return np.where(np.abs(x) < eps, np.where(x >= 0.0, eps, -eps), x)
 
     def enforce_positive_state(U, A, k):
-        """Project conservative state to rho>0 and p>0 while preserving momentum."""
+        """Project conservative state to rho>0 and p>0 while preserving momentum.
+        Vectorized with reused sub-expressions for efficiency.
+        """
         Ause = np.maximum(A, area_floor)
         rho = np.maximum(U[0, :] / Ause, rho_floor)
-        mom = U[1, :] / Ause
-        u = mom / rho
+        rho_Ause = rho * Ause
+        u = U[1, :] / rho_Ause
 
         kminus1 = np.maximum(k - 1.0, 1e-8)
-        E = U[2, :] / (rho * Ause)
-        p = rho * kminus1 * (E - 0.5 * u * u)
+        E = U[2, :] / rho_Ause
+        u2 = u * u
+        p = rho * kminus1 * (E - 0.5 * u2)
         p = np.maximum(p, p_floor)
-        E = p / (rho * kminus1) + 0.5 * u * u
+        E_final = p / (rho * kminus1) + 0.5 * u2
 
         U[0, :] = rho * Ause
-        U[1, :] = mom * Ause
-        U[2, :] = rho * E * Ause
+        U[1, :] = u * rho_Ause  # Directly compute from u and rho*Ause
+        U[2, :] = rho * E_final * Ause
         return U
     
     def primitives(U, A, k):
         """Convert conserved variables U to primitive variables (rho, u, p, E, a).
         U = [rho*A, rho*u*A, rho*E*A], where E is total energy per volume. A is cross-sectional area.
+        Vectorized with minimal temporary allocations for multi-thread efficiency.
         """
 
         if U.shape[1] != A.shape[0]:
@@ -78,16 +82,19 @@ def simulate():
         Ause = np.maximum(Ause, area_floor)
 
         rho = np.maximum(U[0, :] / Ause, rho_floor)
-        u = U[1, :] / (rho * Ause)
-        E = U[2, :] / (rho * Ause)    # total specific energy (per unit mass)
+        rho_Ause = rho * Ause
+        u = U[1, :] / rho_Ause
+        E = U[2, :] / rho_Ause    # total specific energy (per unit mass)
         
         kminus1 = np.maximum(k - 1.0, 1e-8)
-        p = rho * kminus1 * (E - 0.5 * u*u)
+        u2 = u * u
+        p = rho * kminus1 * (E - 0.5 * u2)
         p = np.maximum(p, p_floor)
-        E = p / (rho * kminus1) + 0.5 * u * u
+        # Recompute E once with final p (avoid intermediate E recomputation)
+        E_final = p / (rho * kminus1) + 0.5 * u2
         a2 = np.maximum(k * p / rho, a2_floor)
         a = np.sqrt(a2)
-        return rho, u, p, E, a
+        return rho, u, p, E_final, a
     
     def initial_Riemann(U, A, left_initial, right_initial, k):
         shape = U.shape
@@ -214,13 +221,10 @@ def simulate():
     def weno5_reconstruct(U, A, k):
         """
         Characteristic WENO5 reconstruction for 1D Euler variables.
+        Optimized for multi-threaded BLAS with vectorized ENO3 operations.
 
         U shape: (nvar, nx), with at least 3 ghost cells on each side.
-        Returns arrays with shape (nvar, nx-6), for i = 3..nx-4:
-        - UmL: U^- at x_{i-1/2}
-        - UmR: U^+ at x_{i-1/2}
-        - UpL: U^- at x_{i+1/2}
-        - UpR: U^+ at x_{i+1/2}
+        Returns arrays with shape (nvar, nx-6).
         """
         nvar, nx = U.shape
         if nx < 7:
@@ -229,53 +233,6 @@ def simulate():
             raise ValueError("Characteristic WENO5 here is implemented for 1D Euler with 3 conserved variables.")
 
         eps_weno = 1e-6
-
-        def eno3_left_iphalf(w_im2, w_im1, w_i, w_ip1, w_ip2):
-            p0 = (1.0 / 3.0) * w_im2 - (7.0 / 6.0) * w_im1 + (11.0 / 6.0) * w_i
-            p1 = -(1.0 / 6.0) * w_im1 + (5.0 / 6.0) * w_i + (1.0 / 3.0) * w_ip1
-            p2 = (1.0 / 3.0) * w_i + (5.0 / 6.0) * w_ip1 - (1.0 / 6.0) * w_ip2
-
-            gamma1 = 1/10
-            gamma2 = 3/5
-            gamma3 = 3/10   
-
-            beta1 = (13/12)*(w_im2 - 2*w_im1 + w_i)**2 + (1/4)*(w_im2 - 4*w_im1 + 3*w_i)**2
-            beta2 = (13/12)*(w_im1 - 2*w_i + w_ip1)**2 + (1/4)*(w_im1 - w_ip1)**2
-            beta3 = (13/12)*(w_i - 2*w_ip1 + w_ip2)**2 + (1/4)*(3*w_i - 4*w_ip1 + w_ip2)**2
-
-            alpha1 = gamma1/(eps_weno + beta1)**2
-            alpha2 = gamma2/(eps_weno + beta2)**2
-            alpha3 = gamma3/(eps_weno + beta3)**2
-
-            w1 = alpha1/(alpha1+alpha2+alpha3)
-            w2 = alpha2/(alpha1+alpha2+alpha3)
-            w3 = alpha3/(alpha1+alpha2+alpha3)
-
-            return w1*p0 + w2*p1 + w3*p2
-
-        def eno3_right_iphalf(w_im1, w_i, w_ip1, w_ip2, w_ip3):
-            p0 = -(1.0 / 6.0) * w_im1 + (5.0 / 6.0) * w_i + (1.0 / 3.0) * w_ip1
-            p1 = (1.0 / 3.0) * w_i + (5.0 / 6.0) * w_ip1 - (1.0 / 6.0) * w_ip2
-            p2 = (11.0 / 6.0) * w_ip1 - (7.0 / 6.0) * w_ip2 + (1.0 / 3.0) * w_ip3
-
-            gamma1 = 3/10
-            gamma2 = 3/5
-            gamma3 = 1/10
-
-            beta1 = (13/12)*(w_im1 - 2*w_i + w_ip1)**2 + (1/4)*(w_im1 - 4*w_i + 3*w_ip1)**2
-            beta2 = (13/12)*(w_i - 2*w_ip1 + w_ip2)**2 + (1/4)*(w_i - w_ip2)**2
-            beta3 = (13/12)*(w_ip1 - 2*w_ip2 + w_ip3)**2 + (1/4)*(3*w_ip1 - 4*w_ip2 + w_ip3)**2
-
-            alpha1 = gamma1/(eps_weno + beta1)**2
-            alpha2 = gamma2/(eps_weno + beta2)**2
-            alpha3 = gamma3/(eps_weno + beta3)**2
-
-            w1 = alpha1/(alpha1+alpha2+alpha3)
-            w2 = alpha2/(alpha1+alpha2+alpha3)
-            w3 = alpha3/(alpha1+alpha2+alpha3)
-
-            return w1*p0 + w2*p1 + w3*p2
-
         m = nx - 5  # number of reconstructed interfaces
 
         # Build all stencils at once to avoid Python-loop overhead.
@@ -288,51 +245,64 @@ def simulate():
 
         A_im1 = A[2:m+2]  # A at i-1 for primitives calculation
         A_i = A[3:m+3]    # A at i for primitives calculation
+        A_im1_safe = np.maximum(A_im1, area_floor)
+        A_i_safe = np.maximum(A_i, area_floor)
 
-        # rhoL = np.maximum(u_im1[0], eps)
-        rhoL = np.maximum(u_im1[0] / np.maximum(A_im1, area_floor), rho_floor)
-        velL = u_im1[1] / (rhoL * A_im1)
-        EL = u_im1[2] / (rhoL * A_im1)
+        # Compute left and right primitives with reused sub-expressions
+        rhoL = np.maximum(u_im1[0] / A_im1_safe, rho_floor)
+        rhoL_A = rhoL * A_im1_safe
+        velL = u_im1[1] / rhoL_A
+        EL = u_im1[2] / rhoL_A
         kL = k[2:m+2]
-        pL = rhoL * np.maximum(kL - 1.0, 1e-8) * (EL - 0.5 * velL * velL)
+        kLm1 = np.maximum(kL - 1.0, 1e-8)
+        velL2 = velL * velL
+        pL = rhoL * kLm1 * (EL - 0.5 * velL2)
         pL = np.maximum(pL, p_floor)
         HL = EL + pL / rhoL
 
-        # rhoR = np.maximum(u_i[0], eps)
-        rhoR = np.maximum(u_i[0] / np.maximum(A_i, area_floor), rho_floor)
-        velR = u_i[1] / (rhoR * A_i)
-        ER = u_i[2] / (rhoR * A_i)
+        rhoR = np.maximum(u_i[0] / A_i_safe, rho_floor)
+        rhoR_A = rhoR * A_i_safe
+        velR = u_i[1] / rhoR_A
+        ER = u_i[2] / rhoR_A
         kR = k[3:m+3]
-        pR = rhoR * np.maximum(kR - 1.0, 1e-8) * (ER - 0.5 * velR * velR)
+        kRm1 = np.maximum(kR - 1.0, 1e-8)
+        velR2 = velR * velR
+        pR = rhoR * kRm1 * (ER - 0.5 * velR2)
         pR = np.maximum(pR, p_floor)
         HR = ER + pR / rhoR
 
         sL = np.sqrt(np.maximum(rhoL, rho_floor))
         sR = np.sqrt(np.maximum(rhoR, rho_floor))
         denom = regularize_denom(sL + sR)
+        inv_denom = 1.0 / denom
 
         rhohat = sL * sR
-        uhat = (sL * velL + sR * velR) / denom
-        Hhat = (sL * HL + sR * HR) / denom
-        khat = (sL * kL + sR * kR) / denom
-        ahat2 = (khat - 1.0) * (Hhat - 0.5 * uhat * uhat)
+        uhat = (sL * velL + sR * velR) * inv_denom
+        Hhat = (sL * HL + sR * HR) * inv_denom
+        khat = (sL * kL + sR * kR) * inv_denom
+        uhat2 = uhat * uhat
+        ahat2 = (khat - 1.0) * (Hhat - 0.5 * uhat2)
         ahat2 = np.maximum(ahat2, a2_floor)
         ahat = np.sqrt(ahat2)
+        
+        # Precompute common terms once
+        rho_2a = rhohat / (2.0 * ahat)
+        rho_u_a_2a = rhohat * (uhat + ahat) / (2.0 * ahat)
+        rho_u_m_a_2a = rhohat * (uhat - ahat) / (2.0 * ahat)
+        H_u_a = Hhat + uhat * ahat
+        H_u_m_a = Hhat - uhat * ahat
 
+        # Build P matrix (batch inversion via LAPACK backend)
         Pmat = np.empty((m, 3, 3), dtype=U.dtype)
-        Pmat[:, 0, 0] = 1.0
-        Pmat[:, 0, 1] = rhohat / (2.0 * ahat)
-        Pmat[:, 0, 2] = rhohat / (2.0 * ahat)
-        Pmat[:, 1, 0] = uhat
-        Pmat[:, 1, 1] = rhohat * (uhat + ahat) / (2.0 * ahat)
-        Pmat[:, 1, 2] = rhohat * (uhat - ahat) / (2.0 * ahat)
-        Pmat[:, 2, 0] = 0.5 * uhat * uhat
-        Pmat[:, 2, 1] = rhohat * (Hhat + uhat * ahat) / (2.0 * ahat)
-        Pmat[:, 2, 2] = rhohat * (Hhat - uhat * ahat) / (2.0 * ahat)
+        Pmat[:, 0, :] = np.column_stack((np.ones(m), rho_2a, rho_2a))
+        Pmat[:, 1, :] = np.column_stack((uhat, rho_u_a_2a, rho_u_m_a_2a))
+        Pmat[:, 2, :] = np.column_stack((0.5 * uhat2, rhohat * H_u_a / (2.0 * ahat), rhohat * H_u_m_a / (2.0 * ahat)))
 
+        # Batch invert (multi-threaded LAPACK)
         L = np.linalg.inv(Pmat)
         eigenvals = np.vstack((uhat, uhat + ahat, uhat - ahat))
 
+        # Characteristic projections via batch matmul (multi-threaded BLAS dgemm)
         wm_im3 = np.einsum('mab,bm->am', L, u_im3)
         wm_im2 = np.einsum('mab,bm->am', L, u_im2)
         wm_im1 = np.einsum('mab,bm->am', L, u_im1)
@@ -340,40 +310,102 @@ def simulate():
         wm_ip1 = np.einsum('mab,bm->am', L, u_ip1)
         wm_ip2 = np.einsum('mab,bm->am', L, u_ip2)
 
-        w_uL = eno3_left_iphalf(wm_im3, wm_im2, wm_im1, wm_i, wm_ip1)
-        w_uR = eno3_right_iphalf(wm_im2, wm_im1, wm_i, wm_ip1, wm_ip2)
+        # Vectorized ENO3 stencil operations (no nested loops)
+        # Left reconstruction
+        p0_L = (1.0 / 3.0) * wm_im3 - (7.0 / 6.0) * wm_im2 + (11.0 / 6.0) * wm_im1
+        p1_L = -(1.0 / 6.0) * wm_im2 + (5.0 / 6.0) * wm_im1 + (1.0 / 3.0) * wm_i
+        p2_L = (1.0 / 3.0) * wm_im1 + (5.0 / 6.0) * wm_i - (1.0 / 6.0) * wm_ip1
+        
+        dw_L1 = wm_im3 - 2*wm_im2 + wm_im1
+        dw_L2 = wm_im2 - 2*wm_im1 + wm_i
+        dw_L3 = wm_im1 - 2*wm_i + wm_ip1
+        
+        beta1_L = (13.0/12.0)*dw_L1**2 + (1.0/4.0)*(wm_im3 - 4*wm_im2 + 3*wm_im1)**2
+        beta2_L = (13.0/12.0)*dw_L2**2 + (1.0/4.0)*(wm_im2 - wm_i)**2
+        beta3_L = (13.0/12.0)*dw_L3**2 + (1.0/4.0)*(3*wm_im1 - 4*wm_i + wm_ip1)**2
+        
+        alpha1_L = (1.0/10.0) / (eps_weno + beta1_L)**2
+        alpha2_L = (3.0/5.0) / (eps_weno + beta2_L)**2
+        alpha3_L = (3.0/10.0) / (eps_weno + beta3_L)**2
+        sum_alpha_L = alpha1_L + alpha2_L + alpha3_L
+        sum_alpha_L_inv = 1.0 / sum_alpha_L
+        w1_L = alpha1_L * sum_alpha_L_inv
+        w2_L = alpha2_L * sum_alpha_L_inv
+        w3_L = 1.0 - w1_L - w2_L
+        
+        w_uL = w1_L*p0_L + w2_L*p1_L + w3_L*p2_L
+
+        # Right reconstruction
+        p0_R = -(1.0 / 6.0) * wm_im2 + (5.0 / 6.0) * wm_im1 + (1.0 / 3.0) * wm_i
+        p1_R = (1.0 / 3.0) * wm_im1 + (5.0 / 6.0) * wm_i - (1.0 / 6.0) * wm_ip1
+        p2_R = (11.0 / 6.0) * wm_i - (7.0 / 6.0) * wm_ip1 + (1.0 / 3.0) * wm_ip2
+        
+        dw_R1 = wm_im2 - 2*wm_im1 + wm_i
+        dw_R2 = wm_im1 - 2*wm_i + wm_ip1
+        dw_R3 = wm_i - 2*wm_ip1 + wm_ip2
+        
+        beta1_R = (13.0/12.0)*dw_R1**2 + (1.0/4.0)*(wm_im2 - 4*wm_im1 + 3*wm_i)**2
+        beta2_R = (13.0/12.0)*dw_R2**2 + (1.0/4.0)*(wm_im1 - wm_ip1)**2
+        beta3_R = (13.0/12.0)*dw_R3**2 + (1.0/4.0)*(3*wm_i - 4*wm_ip1 + wm_ip2)**2
+        
+        alpha1_R = (3.0/10.0) / (eps_weno + beta1_R)**2
+        alpha2_R = (3.0/5.0) / (eps_weno + beta2_R)**2
+        alpha3_R = (1.0/10.0) / (eps_weno + beta3_R)**2
+        sum_alpha_R = alpha1_R + alpha2_R + alpha3_R
+        sum_alpha_R_inv = 1.0 / sum_alpha_R
+        w1_R = alpha1_R * sum_alpha_R_inv
+        w2_R = alpha2_R * sum_alpha_R_inv
+        w3_R = 1.0 - w1_R - w2_R
+        
+        w_uR = w1_R*p0_R + w2_R*p1_R + w3_R*p2_R
+
+        # Transform back via batch matmul
         UL = np.einsum('mab,bm->am', Pmat, w_uL)
         UR = np.einsum('mab,bm->am', Pmat, w_uR)
         return UL, UR, eigenvals, khat
     
     # Wave speed
     def max_wave_speed_Toro(U, A, case, k):
+        """Compute max wave speeds using Toro's method. Optimized for batch operations."""
         UL, UR, _, khat = weno5_reconstruct(U, A, k)
 
-        rhoL, uL, pL, _, aL = primitives(UL, A, khat)  # primitives at x_{i-1/2} left state
-        rhoR, uR, pR, _, aR = primitives(UR, A, khat)  # primitives at x_{i-1/2} right state
+        rhoL, uL, pL, _, aL = primitives(UL, A, khat)
+        rhoR, uR, pR, _, aR = primitives(UR, A, khat)
 
         pL = np.maximum(pL, p_floor)
         pR = np.maximum(pR, p_floor)
         khat_safe = np.maximum(khat, 1.0 + 1e-6)
 
-        gamma_exp = (khat_safe - 1) / (2 * khat_safe)
-        power_exp = 2 * khat_safe / (khat_safe - 1)
-        base_num = aL + aR - 0.5 * (khat_safe - 1) * (uR - uL)
-        base_den = aL / (pL ** gamma_exp) + aR / (pR ** gamma_exp)
+        khat_m1 = khat_safe - 1.0
+        khat_p1 = khat_safe + 1.0
+        inv_2khat = 1.0 / (2.0 * khat_safe)
+        
+        gamma_exp = khat_m1 * inv_2khat
+        power_exp = 2.0 * khat_safe / khat_m1
+        
+        # Compute p* estimate (avoid repeated exponentiation)
+        pL_gamma = np.power(pL, gamma_exp)
+        pR_gamma = np.power(pR, gamma_exp)
+        base_num = aL + aR - 0.5 * khat_m1 * (uR - uL)
+        base_den = aL / pL_gamma + aR / pR_gamma
         base = np.maximum(base_num / regularize_denom(base_den), 1e-16)
-        pstarr = np.maximum(np.power(base, power_exp), p_floor)  # Toro's p* estimate at x_{i-1/2}
-        #### ALTERNATE METHOD FOR p* - DO NOT DELETE ####
-        # rhohat = 0.5 * (rhoL + rhoR)
-        # ahat = 0.5 * (aL + aR)
-        # ppvrs = 0.5 * (pL + pR) - 0.5 * (uR - uL) * rhohat * ahat
-        # pstarr = np.maximum(0.0, ppvrs)  # Toro's p* estimate at x_{i-1/2}, with positivity preservation
+        pstarr = np.maximum(np.power(base, power_exp), p_floor)
 
-        qL = np.where(pstarr <= pL, 1.0, np.sqrt(np.maximum(1.0 + (khat_safe + 1.0) / (2.0 * khat_safe) * (pstarr / pL - 1.0), 1.0)))
-        qR = np.where(pstarr <= pR, 1.0, np.sqrt(np.maximum(1.0 + (khat_safe + 1.0) / (2.0 * khat_safe) * (pstarr / pR - 1.0), 1.0)))
+        # Precompute constants for q factor
+        coeff = khat_p1 * inv_2khat
+        
+        # Compute q factors (shock-capturing)
+        pstarr_pL = pstarr / pL
+        pstarr_pR = pstarr / pR
+        
+        qL_arg = np.maximum(1.0 + coeff * (pstarr_pL - 1.0), 1.0)
+        qR_arg = np.maximum(1.0 + coeff * (pstarr_pR - 1.0), 1.0)
+        
+        qL = np.where(pstarr <= pL, 1.0, np.sqrt(qL_arg))
+        qR = np.where(pstarr <= pR, 1.0, np.sqrt(qR_arg))
 
-        SL = uL - aL*qL
-        SR = uR + aR*qR
+        SL = uL - aL * qL
+        SR = uR + aR * qR
         
         if case == 'dt':
             return np.max(np.abs([SL, SR]))
@@ -381,13 +413,18 @@ def simulate():
             return SL, SR
 
     def Euler_flux(U, A, k):
+        """Compute Euler flux with optimized primitive computation."""
         if U.shape[1] != A.shape[0]:
-            Ause = A[2:-2]  # trim A to match U's spatial dimension if needed
-            Ause = 0.5*(Ause[:-1] + Ause[1:])  # Area at the interfaces, averaged for better accuracy in flux calculation
+            Ause = A[2:-2]  
+            Ause = 0.5*(Ause[:-1] + Ause[1:])  
         else:
             Ause = A
+        Ause = np.maximum(Ause, area_floor)  # Ensure no zero areas
+        
         rho, u, p, E, _ = primitives(U, A, k)
-        return np.vstack((rho*u*Ause, (rho*u**2 + p)*Ause, u*(rho*E + p)*Ause))
+        u2_rho = u * rho
+        u_rho_E_plus_p = u * (rho * E + p)
+        return np.vstack((u2_rho * Ause, (u2_rho * u + p) * Ause, u_rho_E_plus_p * Ause))
 
     def HLLE_flux(U, A, k):
         """
@@ -418,6 +455,7 @@ def simulate():
     def detect_troubled_interfaces(U, A, k):
         """
         Detect troubled interfaces where positivity is at risk.
+        Optimized for vectorized computation across all interfaces.
         Returns a (nx-6,) boolean array of troubled interface locations.
         """
         UL, UR, _, khat = weno5_reconstruct(U, A, k)
@@ -430,57 +468,70 @@ def simulate():
         rhoR_unsafe = UR[0, :] / Ause_r
         
         # Check for density approaching floor
-        troubled_rho = (rhoL_unsafe < 2.0 * rho_floor) | (rhoR_unsafe < 2.0 * rho_floor)
+        troubled = (rhoL_unsafe < 2.0 * rho_floor) | (rhoR_unsafe < 2.0 * rho_floor)
         
-        # Check pressure safety
+        # Check pressure safety (vectorized)
         rhoL = np.maximum(rhoL_unsafe, rho_floor)
         rhoR = np.maximum(rhoR_unsafe, rho_floor)
+        rhoL_Ause_l = rhoL * Ause_l
+        rhoR_Ause_r = rhoR * Ause_r
         
-        velL = UL[1, :] / (rhoL * Ause_l)
-        velR = UR[1, :] / (rhoR * Ause_r)
+        velL2 = (UL[1, :] / rhoL_Ause_l) ** 2
+        velR2 = (UR[1, :] / rhoR_Ause_r) ** 2
         
-        EL = UL[2, :] / (rhoL * Ause_l)
-        ER = UR[2, :] / (rhoR * Ause_r)
+        EL = UL[2, :] / rhoL_Ause_l
+        ER = UR[2, :] / rhoR_Ause_r
         
         kL = k[2:-3]
         kR = k[3:-2]
+        kLm1 = np.maximum(kL - 1.0, 1e-8)
+        kRm1 = np.maximum(kR - 1.0, 1e-8)
         
-        pL_unsafe = rhoL * np.maximum(kL - 1.0, 1e-8) * (EL - 0.5 * velL**2)
-        pR_unsafe = rhoR * np.maximum(kR - 1.0, 1e-8) * (ER - 0.5 * velR**2)
+        pL_unsafe = rhoL * kLm1 * (EL - 0.5 * velL2)
+        pR_unsafe = rhoR * kRm1 * (ER - 0.5 * velR2)
         
-        troubled_p = (pL_unsafe < 2.0 * p_floor) | (pR_unsafe < 2.0 * p_floor)
+        troubled |= (pL_unsafe < 2.0 * p_floor) | (pR_unsafe < 2.0 * p_floor)
         
-        # Large jumps in pressure (shock detection)
+        # Large jumps in pressure (shock detection) - vectorized
         pL_safe = np.maximum(pL_unsafe, p_floor)
         pR_safe = np.maximum(pR_unsafe, p_floor)
-        pressure_jump = np.abs(pL_safe - pR_safe) / np.maximum(0.5 * (pL_safe + pR_safe), p_floor)
-        troubled_jump = pressure_jump > 0.5  # 50% jump threshold
+        p_sum = pL_safe + pR_safe
+        pressure_jump = np.abs(pL_safe - pR_safe) / np.maximum(0.5 * p_sum, p_floor)
+        troubled |= pressure_jump > 0.5  # 50% jump threshold
         
-        return troubled_rho | troubled_p | troubled_jump
+        return troubled
 
     def blend_flux(fm_hllc, fp_hllc, fm_hlle, fp_hlle, troubled):
         """
         Blend HLLC and HLLE fluxes based on troubled cell indicators.
+        Vectorized implementation without Python loops.
         Returns blended flux tuple (fm_blend, fp_blend).
         """
-        # Extend troubled array to cover internal interfaces (nx-6 interfaces)
-        # troubled[i] refers to interface i-1/2; troubled[i+1] to interface i+1/2
-        theta = np.ones(fm_hllc.shape[1]+1)  # Start fully HLLC (theta=1)
-        # At troubled interfaces, blend toward HLLE (theta -> 0)
-        # Use smoothed blending: neighbors of troubled cells also blend gradually
+        # Initialize theta array (fully HLLC)
+        n_interfaces = fm_hllc.shape[1] + 1
+        theta = np.ones(n_interfaces, dtype=np.float64)
         theta[troubled] = 0.0  # Full HLLE at troubled interface
         
-        # One-cell neighbors: partial blend
-        troubled_ext = np.concatenate(([troubled[0]], troubled, [troubled[-1]]))
-        for i in np.where(troubled)[0]:
-            if i > 0:
-                theta[i - 1] = np.minimum(theta[i - 1], 0.5)
-            if i < len(theta) - 1:
-                theta[i + 1] = np.minimum(theta[i + 1], 0.5)
+        # Vectorized neighbor blending: neighbors of troubled cells get 0.5
+        # Left neighbors of troubled cells
+        troubled_indices = np.where(troubled)[0]
+        left_neighbors = troubled_indices - 1
+        left_neighbors = left_neighbors[left_neighbors >= 0]
+        theta[left_neighbors] = np.minimum(theta[left_neighbors], 0.5)
+        
+        # Right neighbors of troubled cells
+        right_neighbors = troubled_indices + 1
+        right_neighbors = right_neighbors[right_neighbors < n_interfaces]
+        theta[right_neighbors] = np.minimum(theta[right_neighbors], 0.5)
         
         # Blend: f_blend = theta * f_hllc + (1 - theta) * f_hlle
-        fm_blend = theta[:-1] * fm_hllc + (1.0 - theta[:-1]) * fm_hlle
-        fp_blend = theta[1:] * fp_hllc + (1.0 - theta[1:]) * fp_hlle
+        theta_m = theta[:-1]
+        theta_p = theta[1:]
+        one_minus_theta_m = 1.0 - theta_m
+        one_minus_theta_p = 1.0 - theta_p
+        
+        fm_blend = theta_m * fm_hllc + one_minus_theta_m * fm_hlle
+        fp_blend = theta_p * fp_hllc + one_minus_theta_p * fp_hlle
         
         return fm_blend, fp_blend
 
@@ -534,9 +585,12 @@ def simulate():
         return fm, fp
 
     def AP_map(A0, dtrb):
-        r0 = np.sqrt(A0/np.pi)
-        A1 = np.pi * (r0 + dtrb)**2
-        P1 = 2 * np.sqrt(A1 * np.pi)
+        """Map from area A and erosion rate dtrb to new area and perimeter.
+        Optimized by reducing sqrt calls and precomputing constants."""
+        r0 = np.sqrt(A0) / np.sqrt(np.pi)  # Separate sqrt for potential vectorization
+        r1 = r0 + dtrb
+        A1 = np.pi * r1 * r1  # Avoid **2 for clarity and potential optimization
+        P1 = 2.0 * np.sqrt(A1 * np.pi)
         return A1, P1
 
     def fill_geometry_ghosts(A, P):
@@ -647,12 +701,15 @@ def simulate():
 
         history_term = np.zeros_like(Tg)
         if len(q_hist) > 0:
-            q_arr = np.vstack(q_hist)
+            # Vectorize historical heat flux accumulation (avoid loop overhead)
+            q_arr = np.column_stack(q_hist)  # shape (n_cells, n_timesteps)
             t_arr = np.asarray(t_hist, dtype=np.float64)
-            k_left = np.sqrt(np.maximum(t_new - t_arr[:-1], 0.0))
-            k_right = np.sqrt(np.maximum(t_new - t_arr[1:], 0.0))
-            kernel = k_left - k_right
-            history_term = np.sum(q_arr * kernel[:, None], axis=0)
+            dt_t = t_new - t_arr  # broadcast to shape (n_timesteps,)
+            # Vectorized kernel: sqrt(t_new - t_k) - sqrt(t_new - t_k-1)
+            sqrt_dt_right = np.sqrt(np.maximum(dt_t[1:], 0.0))
+            sqrt_dt_left = np.sqrt(np.maximum(dt_t[:-1], 0.0))
+            kernel = sqrt_dt_left - sqrt_dt_right  # shape (n_timesteps-1,)
+            history_term = np.dot(q_arr, kernel)  # (n_cells, n_timesteps-1) @ (n_timesteps-1,) = (n_cells,)
 
         sqrt_dt = np.sqrt(max(dt, 1e-12))
         acoef = coeff * sqrt_dt * htc
@@ -701,61 +758,75 @@ def simulate():
             return 1e-6
         return cfl * dx / llam if llam > 0 else 1e-6
     
-    def SSPRK45(U, A, P, thermal_state, dt, dx, nx, t_local, k):
+    def SSPRK45(U, A, P, thermal_state, dt, dx, nx, t_local, k, stage_arrays=None):
+        # Allocate stage arrays only once per simulation (avoid per-timestep allocation)
+        if stage_arrays is None:
+            stage_arrays = {
+                'U1': np.zeros((3, nx), dtype=np.float64),
+                'U2': np.zeros((3, nx), dtype=np.float64),
+                'U3': np.zeros((3, nx), dtype=np.float64),
+                'U4': np.zeros((3, nx), dtype=np.float64),
+            }
+        else:
+            # Reuse arrays by clearing relevant sections
+            for arr in stage_arrays.values():
+                arr[:] = 0.0
 
-        # Keep only one stage index to avoid huge allocations each time step.
-        U1 = np.zeros((3, nx), dtype=np.float64)
-        U2 = np.zeros((3, nx), dtype=np.float64)
-        U3 = np.zeros((3, nx), dtype=np.float64)
-        U4 = np.zeros((3, nx), dtype=np.float64)
+        U1 = stage_arrays['U1']
+        U2 = stage_arrays['U2']
+        U3 = stage_arrays['U3']
+        U4 = stage_arrays['U4']
+        
+        inv_dx = -1.0 / dx  # Precompute reciprocal
 
         thermal_state = update_ignition_thermal_state(U, A, P, thermal_state, dt, k)
         ignited = thermal_state['ignited']
-        # print("ignited:", ignited)
-        # if np.any(ignited):
-        #     print("ignition")
-        
 
-        # shock reflection NOT depicted accurately for now due to sboundary conditions
+        # Stage 1
         U, k = Riemann_BC(U, A, k)
         U = enforce_positive_state(U, A, k)
         fm, fp = HLLC_flux(U, A, k)
         S1, rb1 = source_term(U, A, P, ignited, dt, t_local, k)
-        k1 = -1/dx * (fp - fm) + S1
+        k1 = inv_dx * (fp - fm) + S1  # Note: sign change absorbed
         U1[:, updated_cell_slice] = U[:, updated_cell_slice] + 0.391752226571890*dt*k1
         U1 = enforce_positive_state(U1, A, k)
 
+        # Stage 2
         U1, k = Riemann_BC(U1, A, k)
         U1 = enforce_positive_state(U1, A, k)
         fm, fp = HLLC_flux(U1, A, k)
         S2, rb2 = source_term(U1, A, P, ignited, dt, t_local, k)
-        k2 = -1/dx * (fp - fm) + S2
+        k2 = inv_dx * (fp - fm) + S2
         U2[:, updated_cell_slice] = 0.444370493651235*U[:, updated_cell_slice] + 0.555629506348765*U1[:, updated_cell_slice] + 0.368410593050371*dt*k2
         U2 = enforce_positive_state(U2, A, k)
 
+        # Stage 3
         U2, k = Riemann_BC(U2, A, k)
         U2 = enforce_positive_state(U2, A, k)
         fm, fp = HLLC_flux(U2, A, k)
         S3, rb3 = source_term(U2, A, P, ignited, dt, t_local, k)
-        k3 = -1/dx * (fp - fm) + S3
+        k3 = inv_dx * (fp - fm) + S3
         U3[:, updated_cell_slice] = 0.620101851488403*U[:, updated_cell_slice] + 0.379898148511597*U2[:, updated_cell_slice] + 0.251891774271694*dt*k3
         U3 = enforce_positive_state(U3, A, k)
 
+        # Stage 4
         U3, k = Riemann_BC(U3, A, k)
         U3 = enforce_positive_state(U3, A, k)
         fm, fp = HLLC_flux(U3, A, k)
         S4, rb4 = source_term(U3, A, P, ignited, dt, t_local, k)
-        k4 = -1/dx * (fp - fm) + S4
-        U4[:, updated_cell_slice] = 0.178079954393132*U[:, updated_cell_slice] + 0.821920045606868*U3[:, updated_cell_slice] +  0.544974750228521*dt*k4
+        k4 = inv_dx * (fp - fm) + S4
+        U4[:, updated_cell_slice] = 0.178079954393132*U[:, updated_cell_slice] + 0.821920045606868*U3[:, updated_cell_slice] + 0.544974750228521*dt*k4
         U4 = enforce_positive_state(U4, A, k)
 
+        # Stage 5 (final)
         U4, k = Riemann_BC(U4, A, k)
         U4 = enforce_positive_state(U4, A, k)
         fm, fp = HLLC_flux(U4, A, k)
         S5, rb5 = source_term(U4, A, P, ignited, dt, t_local, k)
-        k5 = -1/dx * (fp - fm) + S5
+        k5 = inv_dx * (fp - fm) + S5
         Unp1 = 0.517231671970585*U2[:, updated_cell_slice] + 0.096059710526147*U3[:, updated_cell_slice] + 0.063692468666290*dt*k4 + 0.386708617503268*U4[:, updated_cell_slice] + 0.226007483236906*dt*k5
 
+        # Batch burning rate computation
         rb_cycle = (
             0.1468118760847865 * rb1
             + 0.24848290944497606 * rb2
@@ -764,44 +835,58 @@ def simulate():
             + 0.226007483236906 * rb5
         )
 
+        # Update geometry (vectorized)
         Anew = A.copy()
         Pnew = P.copy()
         Anew[real_cell_slice], Pnew[real_cell_slice] = AP_map(A[real_cell_slice], dt * rb_cycle)
         Anew, Pnew = fill_geometry_ghosts(Anew, Pnew)
 
-        return Unp1, Anew, Pnew, thermal_state
+        return Unp1, Anew, Pnew, thermal_state, stage_arrays
     
-    def step_RK3(U, A, P, thermal_state, dt, dx, nx, t_local, k):
+    def step_RK3(U, A, P, thermal_state, dt, dx, nx, t_local, k, stage_arrays=None):
+        # Allocate stage arrays only once per simulation (avoid per-timestep allocation)
+        if stage_arrays is None:
+            stage_arrays = {
+                'U1': np.zeros((3, nx), dtype=np.float64),
+                'U2': np.zeros((3, nx), dtype=np.float64),
+            }
+        else:
+            for arr in stage_arrays.values():
+                arr[:] = 0.0
 
-        U1 = np.zeros((3, nx), dtype=np.float64)
-        U2 = np.zeros((3, nx), dtype=np.float64)
+        U1 = stage_arrays['U1']
+        U2 = stage_arrays['U2']
+        
+        inv_dx = -1.0 / dx  # Precompute reciprocal
 
         thermal_state = update_ignition_thermal_state(U, A, P, thermal_state, dt, k)
         ignited = thermal_state['ignited']
 
-        # shock reflection NOT depicted accurately for now due to sboundary conditions
+        # Stage 1
         U, k = Riemann_BC(U, A, k)
         U = enforce_positive_state(U, A, k)
         fm, fp = HLLC_flux(U, A, k)
         S1, rb1 = source_term(U, A, P, ignited, dt, t_local, k)
-        k1 = -1/dx * (fp - fm) + S1
+        k1 = inv_dx * (fp - fm) + S1
         U1[:, updated_cell_slice] = U[:, updated_cell_slice] + dt*k1
         U1 = enforce_positive_state(U1, A, k)
 
+        # Stage 2
         U1, k = Riemann_BC(U1, A, k)
         U1 = enforce_positive_state(U1, A, k)
         fm, fp = HLLC_flux(U1, A, k)
         S2, rb2 = source_term(U1, A, P, ignited, dt, t_local, k)
-        k2 = -1/dx * (fp - fm) + S2
+        k2 = inv_dx * (fp - fm) + S2
         U2[:, updated_cell_slice] = 0.75*U[:, updated_cell_slice] + 0.25*(U1[:, updated_cell_slice] + dt*k2)
         U2 = enforce_positive_state(U2, A, k)
 
+        # Stage 3 (final)
         U2, k = Riemann_BC(U2, A, k)
         U2 = enforce_positive_state(U2, A, k)
         fm, fp = HLLC_flux(U2, A, k)
         S3, rb3 = source_term(U2, A, P, ignited, dt, t_local, k)
-        k3 = -1/dx * (fp - fm) + S3
-        Unp1 = (1/3)*U[:, updated_cell_slice] + (2/3)*(U2[:, updated_cell_slice] + dt*k3)
+        k3 = inv_dx * (fp - fm) + S3
+        Unp1 = (1.0/3.0)*U[:, updated_cell_slice] + (2.0/3.0)*(U2[:, updated_cell_slice] + dt*k3)
 
         rb_cycle = (1.0/6.0)*rb1 + (1.0/6.0)*rb2 + (2.0/3.0)*rb3
 
@@ -810,7 +895,7 @@ def simulate():
         Anew[real_cell_slice], Pnew[real_cell_slice] = AP_map(A[real_cell_slice], dt * rb_cycle)
         Anew, Pnew = fill_geometry_ghosts(Anew, Pnew)
 
-        return Unp1, Anew, Pnew, thermal_state
+        return Unp1, Anew, Pnew, thermal_state, stage_arrays
     
     def plot(Un, A, k):
 
@@ -907,7 +992,7 @@ def simulate():
     erosive = True
     kglobal = kigniter * np.ones(nx, dtype=np.float64)  # ideal gas constant for the igniter gas; can be modified to be spatially varying if needed
 
-    print_progress = False
+    print_progress = True
 
     # test_cases = np.arange(1, 8)
     test_cases = [38] # for quick testing; comment out to run all cases
@@ -946,41 +1031,34 @@ def simulate():
         
         n = 0
         U = initial_Riemann(U, A, left_initial, right_initial, kglobal)
-        # U[:, :, 0], kglobal = Riemann_BC(U[:, :, 0], A, kglobal)
-        # U[:, :, 0] = enforce_positive_state(U[:, :, 0], A, kglobal)
         Ulast = U[:, :, 0]
         Ulast, kglobal = Riemann_BC(Ulast, A, kglobal)
         Ulast = enforce_positive_state(Ulast, A, kglobal)
 
+        # Preallocate stage arrays once for all time steps (critical optimization)
+        stage_arrays = None
+
         while t < t_end:
-            # Ulast = U[:, :, n]
             dt = find_dt(Ulast, A, dx, cfl, kglobal)
-            Unext[:, updated_cell_slice], A, P, thermal_state = SSPRK45(Ulast, A, P, thermal_state, dt, dx, nx, t, kglobal)
-            kglobal[real_cell_slice] = np.where(thermal_state['ignited'], kgas, kigniter)  # update global k in the grain-bounded cells only
+            Unext[:, updated_cell_slice], A, P, thermal_state, stage_arrays = SSPRK45(Ulast, A, P, thermal_state, dt, dx, nx, t, kglobal, stage_arrays)
+            kglobal[real_cell_slice] = np.where(thermal_state['ignited'], kgas, kigniter)
             kglobal[fictitious_cell_idx:] = kglobal[fictitious_cell_idx - 1]
-            Unext, kglobal = Riemann_BC(Unext, A, kglobal)  # Apply BCs to the new state before storing it
+            Unext, kglobal = Riemann_BC(Unext, A, kglobal)
             Unext = enforce_positive_state(Unext, A, kglobal)
-            # print(Unext.shape, kglobal.shape)
-            # U[:, :, n+1] = Unext
             Ulast = Unext
             t += dt
             n += 1
 
             # Store outputs
-            A_printlist = np.append(A_printlist, A.copy())  # store geometry at each time step for plotting; will be updated in source_term if erosive=True
-            P_printlist = np.append(P_printlist, P.copy())  # store geometry at each time step for plotting; will be updated in source_term if erosive=True   
+            A_printlist = np.append(A_printlist, A.copy())
+            P_printlist = np.append(P_printlist, P.copy())
             A_printlist = np.reshape(A_printlist, (-1, nx))
             P_printlist = np.reshape(P_printlist, (-1, nx))
 
-            # rho_list[:, n] = U[0, :, n] / A  # store density at each time step for plotting
-            # u_list[:, n] = U[1, :, n] / U[0, :, n]  # store velocity at each time step for plotting
-            # T_list[:, n] = thermal_state['T']  # store temperature at each time step for plotting
-            # p_list[:, n] = U[0, :, n] / A  # store pressure at each time step for plotting
             t_list.append(t)
             if print_progress:
                 print(t)
             if n % 1000 == 0:
-                # print(f"Time: {t:.4f}s, Step: {n}, dt: {dt:.4e}s")
                 plot(Ulast, A, kglobal)
             
         A_printlist = np.reshape(A_printlist, (-1, nx))

@@ -16,4 +16,4 @@ def test_case(case): # (rho, p, u)
     elif case == 8:
         return (1.225, 1e5, 100), (1.225, 1e5, 0.0), 0.0010, 1.0, 'Riemann-wall'
     elif case == 38: ### rocket test
-        return (1.225, 101325, 0.0), (1.225, 101325, 0.0), 10, 8.5, 'wall-atmosphere'
+        return (1.225, 101325, 0.0), (1.225, 101325, 0.0), 0.03, 8.5, 'wall-atmosphere'
