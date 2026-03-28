@@ -524,10 +524,10 @@ contains
     	iface_group_size = (n_ifaces + n_tiles - 1) / n_tiles
 
 		! Each tile computes 3 consecutive interfaces, matching a 4-station overlapped stencil chunk.
-		!$omp parallel do default(shared) private(tile, jbeg, jend, j, uim3, uim2, uim1, ui, uip1, uip2, &
-		!$omp&     rhoL, velL, EL, kL, pL, HL, rhoR, velR, ER, kR, pR, HR, sL, sR, denom, rhohat, uhat, Hhat, khat, ahat2, ahat, &
-		!$omp&     Pmat, Lmat, wuL, wuR, wm, p0L, p1L, p2L, p0R, p1R, p2R, dw1, dw2, dw3, b1, b2, b3, a1, a2, a3, asum, A_im1, A_i, kLm1, kRm1, $
-		!$omp&     r) schedule(static)
+		! $omp parallel do default(shared) private(tile, jbeg, jend, j, uim3, uim2, uim1, ui, uip1, uip2, &
+		! $omp&     rhoL, velL, EL, kL, pL, HL, rhoR, velR, ER, kR, pR, HR, sL, sR, denom, rhohat, uhat, Hhat, khat, ahat2, ahat, &
+		! $omp&     Pmat, Lmat, wuL, wuR, wm, p0L, p1L, p2L, p0R, p1R, p2R, dw1, dw2, dw3, b1, b2, b3, a1, a2, a3, asum, A_im1, A_i, kLm1, kRm1, &
+		! $omp&     r) schedule(static)
 		do tile = 1, n_tiles
 			jbeg = 1 + (tile - 1) * iface_group_size
 			jend = min(n_ifaces, jbeg + iface_group_size - 1)
@@ -634,7 +634,7 @@ contains
 				khat_out(j) = khat
 			end do
 		end do
-		!$omp end parallel do
+		! $omp end parallel do
 	end subroutine weno5_reconstruct
 
 	subroutine max_wave_speed_toro(U, A_loc, k, SL, SR, maxabs)
@@ -717,7 +717,7 @@ contains
 				Ause(j) = 0.5_dp * (A_loc(j + 2) + A_loc(j + 3))
 			end do
 		end if
-		! $omp parallel do default(shared) private(j) schedule(static)
+		! $omp parallel do default(shared) private(j) schedule(dynamic)
 		do j = 1, nloc
 			Ause(j) = max(Ause(j), area_floor)
 			flux(1, j) = rho(j) * vel(j) * Ause(j)

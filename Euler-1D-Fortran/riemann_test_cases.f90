@@ -60,7 +60,7 @@ contains
     case (38)
       left_state = [1.225_dp, 101325.0_dp, 0.0_dp]
       right_state = [1.225_dp, 101325.0_dp, 0.0_dp]
-      t_end = 0.03_dp
+      t_end = 0.1_dp
       xdom = 8.5_dp
       boundary_case = 'wall-atmosphere'
     case default

@@ -65,7 +65,7 @@ int get_test_case(int case_id, RiemannCase* out_case) {
         case 38:
             out_case->left = (PrimitiveState){1.225, 101325.0, 0.0};
             out_case->right = (PrimitiveState){1.225, 101325.0, 0.0};
-            out_case->t_end = 0.03;
+            out_case->t_end = 0.1;
             out_case->xdom = 8.5;
             out_case->boundary_case = "wall-atmosphere";
             return 1;

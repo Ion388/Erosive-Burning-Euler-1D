@@ -4,8 +4,8 @@ $ErrorActionPreference = 'Stop'
 # Move to the folder containing this script.
 Set-Location -Path $PSScriptRoot
 
-Write-Host "Setting OpenMP environment variable: OMP_NUM_THREADS=16"
-$env:OMP_NUM_THREADS = 16
+Write-Host "Setting OpenMP environment variable: OMP_NUM_THREADS=8"
+$env:OMP_NUM_THREADS = 1
 
 Write-Host "[1/4] Cleaning previous build artifacts..."
 if (-not (Test-Path -Path "build" -PathType Container)) {
