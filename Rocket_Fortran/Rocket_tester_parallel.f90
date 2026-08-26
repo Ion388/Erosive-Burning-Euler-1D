@@ -1303,9 +1303,9 @@ contains
 					  S(2, 1) = S(2, 1) + (4.0_dp/10.0_dp) * mig * vinj / dx_local
 					  S(3, 1) = S(3, 1) + (4.0_dp/10.0_dp) * mig * hig / dx_local
 
-					  S(1, 2) = S(1, 3) + (3.0_dp/10.0_dp) * mig / dx_local
-					  S(2, 2) = S(2, 3) + (3.0_dp/10.0_dp) * mig * vinj / dx_local
-					  S(3, 2) = S(3, 3) + (3.0_dp/10.0_dp) *  mig * hig / dx_local
+					  S(1, 2) = S(1, 2) + (3.0_dp/10.0_dp) * mig / dx_local
+					  S(2, 2) = S(2, 2) + (3.0_dp/10.0_dp) * mig * vinj / dx_local
+					  S(3, 2) = S(3, 2) + (3.0_dp/10.0_dp) *  mig * hig / dx_local
 
 					  S(1, 3) = S(1, 3) + (2.0_dp/10.0_dp) * mig / dx_local
 					  S(2, 3) = S(2, 3) + (2.0_dp/10.0_dp) * mig * vinj / dx_local

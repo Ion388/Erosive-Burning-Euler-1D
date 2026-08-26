@@ -151,7 +151,7 @@ def main():
     out_dir = Path(f"plots_state_case{case_id}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    max_profiles = 2
+    max_profiles = 10
 
     labels_state = {
         "rho": "Density rho [kg/m^3]",
